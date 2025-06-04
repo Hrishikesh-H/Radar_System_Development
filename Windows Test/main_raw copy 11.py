@@ -1,6 +1,8 @@
-import sys
 import os
+import sys
 import time
+import serial
+import threading
 import traceback
 import numpy as np
 from PyQt6.QtWidgets import QApplication
@@ -9,14 +11,12 @@ from Parser import RadarParser
 from Filter import RadarDespiker
 from Plotter import RadarPlotter
 from GUI import DroneLandingStatus
+from PortFinder import DevicePortFinder
 from PlaneLand import LandingZoneAssessor
 from IMUCompensator import AttitudeCompensator
-from PortFinder import DevicePortFinder
-import threading
-import serial
 
 
-# main_application.py
+
 # main_application.py
 
 # Shared state for autopilot
