@@ -65,6 +65,13 @@ def _autopilot_reconnect_loop(finder):
             time.sleep(reconnect_interval)
 
 
+# Add this constant at the top of the file
+ENABLE_TRACE = False
+
+def maybe_traceback():
+    if ENABLE_TRACE:
+        traceback.print_exc()
+
 if __name__ == "__main__":
     finder = DevicePortFinder()
     radar = None
@@ -114,13 +121,13 @@ if __name__ == "__main__":
                 except RuntimeError as e:
                     current_time = time.strftime("%Y-%m-%d %H:%M:%S")
                     print(f"[Radar][Port Detection Error] {e.__class__.__name__}: {e} | Time: {current_time} | Ports Found: {getattr(e, 'matches', 'unknown')} | Type: RuntimeError. Retrying in {RECONNECT_INTERVAL:.1f}s...")
-                    traceback.print_exc()
+                    maybe_traceback()
                     time.sleep(RECONNECT_INTERVAL)
                     continue
                 except Exception as e:
                     current_time = time.strftime("%Y-%m-%d %H:%M:%S")
                     print(f"[Radar][Unknown Connection Error] {e.__class__.__name__}: {e} | Time: {current_time}. Retrying in {RECONNECT_INTERVAL:.1f}s...")
-                    traceback.print_exc()
+                    maybe_traceback()
                     time.sleep(RECONNECT_INTERVAL)
                     continue  # skip downstream until radar returns
 
@@ -130,7 +137,7 @@ if __name__ == "__main__":
                 last_radar_time = time.time()
             except (serial.SerialException, SerialException) as e:
                 print(f"[Radar][Serial Error] {e.__class__.__name__}: {e}. Closing radar and restarting reconnection...")
-                traceback.print_exc()
+                maybe_traceback()
                 try:
                     radar.close()
                     print("[Radar] Closed radar after SerialException.")
@@ -140,7 +147,7 @@ if __name__ == "__main__":
                 continue  # go back to radar reconnect
             except Exception as e:
                 print(f"[Radar][Frame Read Error] {e.__class__.__name__}: {e}. Closing radar instance and restarting reconnection...")
-                traceback.print_exc()
+                maybe_traceback()
                 try:
                     radar.close()
                     print("[Radar] Closed radar after general read failure.")
@@ -157,16 +164,11 @@ if __name__ == "__main__":
 
                 if compensator:
                     try:
-                        if calli_req:
-                            # Call calibration once
-                            compensator.internal_calibrate_offsets(num_samples=100, delay=0.01) # Replace with your actual calibration method name
-                            calli_req = False  # Reset after one call
-
                         pts_enu = compensator.transform_pointcloud(pts_body)
                         last_att_time = time.time()
                     except Exception as e:
                         print(f"[Autopilot][Compensation Error] {e.__class__.__name__}: {e}. Switching to raw points.")
-                        traceback.print_exc()
+                        maybe_traceback()
                         try:
                             compensator.close()
                         except Exception as ce:
@@ -210,7 +212,7 @@ if __name__ == "__main__":
         print("[System] Interrupted by user. Exiting cleanly...")
     except Exception as e:
         print(f"[System] Unexpected error: {e.__class__.__name__}: {e}")
-        traceback.print_exc()
+        maybe_traceback()
         time.sleep(2)
     finally:
         _autopilot_stop = True
