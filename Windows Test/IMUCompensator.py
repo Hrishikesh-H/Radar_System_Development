@@ -25,7 +25,10 @@ class AttitudeCompensator:
         time.sleep(0.5)
 
         # Start internal calibration automatically
-        self._internal_calibrate_offsets(num_samples=100, delay=0.01)
+         # Start internal calibration automatically ONCE
+        # if calli_req:
+        #     self.internal_calibrate_offsets(num_samples=100, delay=0.01)
+
 
     def _parse_axis_mapping(self, mapping):
         if isinstance(mapping, np.ndarray):
@@ -180,7 +183,7 @@ class AttitudeCompensator:
 
         return R_z @ R_y @ R_x
 
-    def _internal_calibrate_offsets(self, num_samples, delay):
+    def internal_calibrate_offsets(self, num_samples, delay):
         rolls, pitches, yaws = [], [], []
         print(f"[AttitudeCompensator] Starting internal calibration with {num_samples} samples...")
         for _ in range(num_samples):

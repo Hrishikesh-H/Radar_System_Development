@@ -23,6 +23,7 @@ from serial.serialutil import SerialException
 compensator = None
 last_att_time = 0
 _autopilot_stop = False
+calli_req = True  # Set True once here for a single calibration call
 
 # Radar port names, to avoid scanning them
 cli = None
@@ -94,8 +95,9 @@ if __name__ == "__main__":
                 if radar:
                     try:
                         radar.close()
-                    except Exception:
-                        pass
+                        print("[Radar] Closed existing radar instance.")
+                    except Exception as e:
+                        print(f"[Radar] Error during radar close: {e}")
                     radar = None
                     print("[Radar] Previous connection closed due to timeout or error.")
 
@@ -109,8 +111,16 @@ if __name__ == "__main__":
                     time.sleep(2)
                     radar.info_print("Connected to radar successfully.")
                     last_radar_time = time.time()
+                except RuntimeError as e:
+                    current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[Radar][Port Detection Error] {e.__class__.__name__}: {e} | Time: {current_time} | Ports Found: {getattr(e, 'matches', 'unknown')} | Type: RuntimeError. Retrying in {RECONNECT_INTERVAL:.1f}s...")
+                    traceback.print_exc()
+                    time.sleep(RECONNECT_INTERVAL)
+                    continue
                 except Exception as e:
-                    print(f"[Radar] Reconnect failed: {e}. Retrying in {RECONNECT_INTERVAL:.1f}s...")
+                    current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[Radar][Unknown Connection Error] {e.__class__.__name__}: {e} | Time: {current_time}. Retrying in {RECONNECT_INTERVAL:.1f}s...")
+                    traceback.print_exc()
                     time.sleep(RECONNECT_INTERVAL)
                     continue  # skip downstream until radar returns
 
@@ -119,19 +129,23 @@ if __name__ == "__main__":
                 header, det_obj, snr, noise = radar.read_frame()
                 last_radar_time = time.time()
             except (serial.SerialException, SerialException) as e:
-                print(f"[Radar] SerialException during read: {e}. Closing radar and restarting reconnection...")
+                print(f"[Radar][Serial Error] {e.__class__.__name__}: {e}. Closing radar and restarting reconnection...")
+                traceback.print_exc()
                 try:
                     radar.close()
-                except Exception:
-                    pass
+                    print("[Radar] Closed radar after SerialException.")
+                except Exception as ce:
+                    print(f"[Radar] Exception during close after SerialException: {ce}")
                 radar = None
                 continue  # go back to radar reconnect
             except Exception as e:
-                print(f"[Radar] Read failed: {e}. Closing radar instance and restarting reconnection...")
+                print(f"[Radar][Frame Read Error] {e.__class__.__name__}: {e}. Closing radar instance and restarting reconnection...")
+                traceback.print_exc()
                 try:
                     radar.close()
-                except Exception:
-                    pass
+                    print("[Radar] Closed radar after general read failure.")
+                except Exception as ce:
+                    print(f"[Radar] Exception during close after general failure: {ce}")
                 radar = None
                 continue  # go back to radar reconnect
 
@@ -143,11 +157,20 @@ if __name__ == "__main__":
 
                 if compensator:
                     try:
+                        if calli_req:
+                            # Call calibration once
+                            compensator.internal_calibrate_offsets(num_samples=100, delay=0.01) # Replace with your actual calibration method name
+                            calli_req = False  # Reset after one call
+
                         pts_enu = compensator.transform_pointcloud(pts_body)
                         last_att_time = time.time()
                     except Exception as e:
-                        print(f"[Autopilot] Compensation failed: {e}. Switching to raw points.")
-                        compensator.close()
+                        print(f"[Autopilot][Compensation Error] {e.__class__.__name__}: {e}. Switching to raw points.")
+                        traceback.print_exc()
+                        try:
+                            compensator.close()
+                        except Exception as ce:
+                            print(f"[Autopilot] Exception during compensator close: {ce}")
                         compensator = None
                         pts_enu = pts_body
                 else:
@@ -186,7 +209,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("[System] Interrupted by user. Exiting cleanly...")
     except Exception as e:
-        print(f"[System] Unexpected error: {e}")
+        print(f"[System] Unexpected error: {e.__class__.__name__}: {e}")
         traceback.print_exc()
         time.sleep(2)
     finally:
@@ -197,16 +220,15 @@ if __name__ == "__main__":
         if radar:
             try:
                 radar.close()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Cleanup] Failed to close radar: {e}")
         if compensator:
             try:
                 compensator.close()
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Cleanup] Failed to close compensator: {e}")
         try:
             # plotter.export_history_csv()
             plotter.show_history_table()
-        except Exception:
-            pass
-
+        except Exception as e:
+            print(f"[Cleanup] Failed to show history table: {e}")
