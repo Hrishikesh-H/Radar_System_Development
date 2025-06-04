@@ -14,7 +14,7 @@ from GUI import DroneLandingStatus
 from PortFinder import DevicePortFinder
 from PlaneLand import LandingZoneAssessor
 from IMUCompensator import AttitudeCompensator
-
+from serial.serialutil import SerialException
 
 
 # main_application.py
@@ -90,8 +90,8 @@ if __name__ == "__main__":
             now = time.time()
 
             # --- RADAR RECONNECTION LOGIC ---
-            if radar is None or (now - last_radar_time > 5.0):
-                if radar is not None:
+            if radar is None or not radar.data_serial or not radar.data_serial.is_open or (now - last_radar_time > 5.0):
+                if radar:
                     try:
                         radar.close()
                     except Exception:
@@ -118,7 +118,7 @@ if __name__ == "__main__":
             try:
                 header, det_obj, snr, noise = radar.read_frame()
                 last_radar_time = time.time()
-            except serial.SerialException as e:
+            except (serial.SerialException, SerialException) as e:
                 print(f"[Radar] SerialException during read: {e}. Closing radar and restarting reconnection...")
                 try:
                     radar.close()
@@ -209,3 +209,4 @@ if __name__ == "__main__":
             plotter.show_history_table()
         except Exception:
             pass
+

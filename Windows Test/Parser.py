@@ -7,6 +7,7 @@ import traceback
 import numpy as np
 import csv
 import os
+from serial.serialutil import SerialException
 
 MAGIC_WORD = b'\x02\x01\x04\x03\x06\x05\x08\x07'
 MAGIC_WORD_LEN = 8
@@ -254,13 +255,33 @@ class RadarParser:
 
         return header, det_obj, (snr, noise)
 
+
     def read_frame(self):
         try:
-            data = self.data_serial.read(2048)
+            if not self.data_serial or not self.data_serial.is_open:
+                raise SerialException("Serial port is not open or was disconnected.")
+
+            try:
+                data = self.data_serial.read(2048)
+            except (SerialException, PermissionError, OSError) as e:
+                current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                port_info = getattr(self.data_serial, 'port', 'Unknown')
+                self.error_print(f"[{current_time}] [RadarParser: {port_info}] Radar read failed: {e}")
+                if self.data_serial:
+                    try:
+                        self.data_serial.close()
+                    except Exception:
+                        pass
+                self.data_serial = None
+                raise SerialException("Radar disconnected.") from e
+
             self.debug_print_raw(data)
-        except Exception:
-            self.error_print("Error reading from data port")
-            return None, None, None, None
+
+        except Exception as e:
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            port_info = getattr(self.data_serial, 'port', 'Unknown') if self.data_serial else 'Unknown'
+            self.error_print(f"[{current_time}] [RadarParser: {port_info}] Unexpected error: {e}")
+            raise
 
         if data:
             self.buffer.extend(data)
@@ -300,7 +321,11 @@ class RadarParser:
                 return header, det_obj, snr, noise
         else:
             time.sleep(0.001)
+
         return None, None, None, None
+
+
+
 
     def close(self):
         try:
