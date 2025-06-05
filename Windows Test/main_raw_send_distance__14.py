@@ -122,7 +122,8 @@ class LandingMonitor:
     - When in LAND or RTL mode, continuously sends distance sensor and checks surface:
         * If unsafe for more than warning_duration seconds, abort landing (switch to LOITER).
         * Otherwise, if returns to safe before timeout, cancel abort.
-    Additionally prints debug information and reads back the FC’s reported distance after sending.
+    Additionally prints debug information, reads back the FC’s reported distance after sending,
+    and reports an error if the FC shows no data.
     """
     def __init__(self, mav, distance_sender,
                  buffer_size=10,
@@ -156,7 +157,8 @@ class LandingMonitor:
         Behavior:
          1. Compute distance from smoothed_det_obj (min z).
          2. Send distance to FC via distance_sender and log.
-         3. After sending, read back any DISTANCE_SENSOR from FC and print it.
+         3. After sending, read back any DISTANCE_SENSOR from FC, print it,
+            and if it equals max range (no data), report an error.
          4. If mode in ['LAND','RTL'], evaluate surface flatness.
              - If unsafe detected, record start time, send warning via MAVLink STATUSTEXT.
              - If unsafe persists beyond warning_duration, switch to LOITER.
@@ -174,11 +176,20 @@ class LandingMonitor:
         # 2. Send distance sensor MAVLink every call
         self.distance_sender.send(distance_m)
 
-        # 3. Read back any DISTANCE_SENSOR from FC and print it
+        # 3. Read back any DISTANCE_SENSOR from FC and print it; if it equals max_range, report error
         try:
             msg_fb = self.mav.recv_match(type='DISTANCE_SENSOR', blocking=False)
             if msg_fb:
-                print(f"[LandingMonitor] FC reports distance: {msg_fb.current_distance} cm")
+                reported_cm = msg_fb.current_distance
+                print(f"[LandingMonitor] FC reports distance: {reported_cm} cm")
+                if reported_cm >= self.distance_sender.max_distance_cm:
+                    err_text = "FC distance sensor error: no data."
+                    print(f"[LandingMonitor][ERROR] {err_text}")
+                    try:
+                        severity = mavutil.mavlink.MAV_SEVERITY_ERROR
+                        self.mav.mav.statustext_send(severity, err_text.encode('utf-8'))
+                    except Exception as e:
+                        print(f"[LandingMonitor][ERROR] Failed to send STATUSTEXT: {e}")
         except Exception as e:
             print(f"[LandingMonitor][ERROR] Failed to read back DISTANCE_SENSOR: {e}")
 
@@ -191,7 +202,7 @@ class LandingMonitor:
         slope_raw = assessment_result.get('slope_deg', None)
         inlier_raw = assessment_result.get('inlier_ratio', None)
         if slope_raw is not None and inlier_raw is not None:
-            print(f"[LandingMonitor] Debug raw - Slope: {slope_raw:.2f}°, Inlier: {inlier_raw:.2f}")
+            print(f"[LandingMonitor] Debug raw – Slope: {slope_raw:.2f}°, Inlier: {inlier_raw:.2f}")
 
         if 'LAND' in mode_upper or 'RTL' in mode_upper:
             if slope_raw is not None and inlier_raw is not None:
