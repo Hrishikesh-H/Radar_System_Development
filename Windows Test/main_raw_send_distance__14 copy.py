@@ -2,7 +2,6 @@ import os
 import sys
 import time
 import serial
-import struct
 import threading
 import traceback
 import datetime
@@ -11,14 +10,14 @@ from collections import deque
 from pymavlink import mavutil
 from serial.serialutil import SerialException
 
-#--------------------------------------------------------
-from Parser import RadarParser  # We will overwrite this class below
+from Parser import RadarParser
 from Filter import RadarDespiker
 # from Plotter import RadarPlotter
 # from GUI import DroneLandingStatus
 from PortFinder import DevicePortFinder
 from PlaneLand import LandingZoneAssessor
 from IMUCompensator import AttitudeCompensator
+
 
 # ============================ DistanceSensorSender ============================
 
@@ -142,6 +141,7 @@ class DistanceSensorSender:
             ts = datetime.datetime.now().isoformat()
             print(f"[{ts}] [ERROR] send() failed: {e}\n{traceback.format_exc()}")
 
+
 # ============================ ModeWatcher ============================
 
 class ModeWatcher(threading.Thread):
@@ -172,6 +172,7 @@ class ModeWatcher(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
+
 
 # ============================ LandingMonitor ============================
 
@@ -312,7 +313,7 @@ class LandingMonitor:
                         median_slope = float(np.median(np.array(self.slope_buffer)))
                         median_inlier = float(np.median(np.array(self.inlier_buffer)))
                         frame_is_safe = (median_slope < self.threshold_slope) and (median_inlier > self.threshold_inlier)
-                        print(f"[LandingMonitor] Median slope = {median_slope:.2f}deg, "
+                        print(f"[LandingMonitor] Median slope = {median_slope:.2f}°, "
                               f"Median inlier = {median_inlier:.2f} -> "
                               f"{'SAFE' if frame_is_safe else 'UNSAFE'}")
                     else:
@@ -414,10 +415,9 @@ class LandingMonitor:
         self.consec_safe_count = 0
         self.consec_unsafe_count = 0
 
-# ============================ RadarParser (Linux-compatible) ============================
 
+# ========================= END New Classes ==========================
 
-# ========================= END RadarParser ==========================
 
 # main_application.py
 
@@ -435,6 +435,7 @@ data = None
 mode_watcher = None
 distance_sender = None
 landing_monitor = None
+
 
 def _autopilot_reconnect_loop(finder):
     """
@@ -488,18 +489,21 @@ def _autopilot_reconnect_loop(finder):
                         )
                 time.sleep(reconnect_interval)
             except Exception as e:
-                print(f"[Autopilot] Background reconnect failed: {e}. Retrying in {reconnect_interval:.1f}s")
+                print(f"[Autopilot] Background reconnect failed: {e}. Retrying in {reconnect_interval:.1f}s…")
                 traceback.print_exc()
                 time.sleep(reconnect_interval)
         else:
             time.sleep(reconnect_interval)
 
+
 # Add this constant at the top of the file
 ENABLE_TRACE = False
+
 
 def maybe_traceback():
     if ENABLE_TRACE:
         traceback.print_exc()
+
 
 if __name__ == "__main__":
     finder = DevicePortFinder()
@@ -513,7 +517,7 @@ if __name__ == "__main__":
 
     last_radar_time = 0
     RECONNECT_INTERVAL = 3.0
-    READ_TIMEOUT_THRESHOLD = 3.0  # if read_frame takes > 3 s, abort
+    READ_TIMEOUT_THRESHOLD = 7.0  # if read_frame takes > 3 s, abort
 
     # Start background thread for autopilot reconnection
     _autopilot_stop = False
@@ -635,13 +639,13 @@ if __name__ == "__main__":
             else:
                 if safe:
                     radar.info_print(
-                        f"Landing zone SAFE  slope={m['slope_deg']:.1f}deg, "
+                        f"Landing zone SAFE  slope={m['slope_deg']:.1f}°, "
                         f"inliers={m['inlier_ratio']*100:.0f}%, res={m['mean_residual']*100:.1f}cm"
                     )
                 else:
                     radar.warn_print(
                         f"Landing zone UNSAFE ({m.get('reason','')})  "
-                        f"slope={m.get('slope_deg',0):.1f}deg, "
+                        f"slope={m.get('slope_deg',0):.1f}°, "
                         f"inliers={m.get('inlier_ratio',0)*100:.0f}%, res={m.get('mean_residual',0)*100:.1f}cm"
                     )
 
