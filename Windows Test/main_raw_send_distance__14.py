@@ -24,12 +24,14 @@ from serial.serialutil import SerialException
 
 class DistanceSensorSender:
     """
-    Handles sending MAVLink DISTANCE_SENSOR messages continuously, with console logging.
+    Handles sending MAVLink DISTANCE_SENSOR messages at a fixed rate (10 Hz),
+    using MAVLink 1.0 framing, with console logging, error reporting, and traceback on failure.
     """
-    def __init__(self, mav, min_range=0.05, max_range=5.0):
+    def __init__(self, mav, min_range=0.05, max_range=5.0, send_rate_hz=10):
         """
         mav: an active pymavlink connection (master)
         min_range, max_range: sensor bounds in meters
+        send_rate_hz: frequency at which to send DISTANCE_SENSOR messages
         """
         self.mav = mav
         self.min_range_m = min_range
@@ -41,47 +43,70 @@ class DistanceSensorSender:
         self.ROTATION_DOWNWARD = mavutil.mavlink.MAV_SENSOR_ROTATION_PITCH_270
         self.COVARIANCE_UNKNOWN = 255
 
+        self.send_interval = 1.0 / send_rate_hz
+        self._last_send_time = 0.0
+
     def send(self, distance_m):
         """
-        Send a single DISTANCE_SENSOR message based on distance in meters.
-        If distance_m is None or invalid, sends max_distance to indicate no reading.
-        Logs the raw and clamped distances to console.
+        Send a DISTANCE_SENSOR message at up to the configured rate.
+        Uses the helper .distance_sensor_send() to guarantee correct MAVLink 1.0 formatting.
+        Prints traceback if send fails.
         """
-        try:
-            if distance_m is not None and isinstance(distance_m, (int, float)):
-                dist_cm = int(round(distance_m * 100))
-                # clamp
-                clamped_cm = max(self.min_distance_cm, min(dist_cm, self.max_distance_cm))
-                print(f"[DistanceSensor] Raw distance = {distance_m:.3f} m → {dist_cm} cm, Clamped = {clamped_cm} cm")
-                dist_cm = clamped_cm
-            else:
-                # No valid reading → send max range
-                dist_cm = self.max_distance_cm
-                print(f"[DistanceSensor] No valid radar reading. Sending max range = {dist_cm} cm")
+        now = time.time()
+        if (now - self._last_send_time) < self.send_interval:
+            return  # skip: enforcing 10 Hz
 
-            # Timestamp since system boot in ms
+        self._last_send_time = now
+
+        try:
+            # 1) Compute raw and clamped centimeters
+            if distance_m is not None and isinstance(distance_m, (int, float)):
+                raw_cm = int(round(distance_m * 100))
+                clamped_cm = max(self.min_distance_cm, min(raw_cm, self.max_distance_cm))
+                print(f"[DistanceSensor] Raw distance = {distance_m:.3f} m → {raw_cm} cm, Clamped → {clamped_cm} cm")
+                current_cm = clamped_cm
+            else:
+                current_cm = self.max_distance_cm
+                print(f"[DistanceSensor] No valid radar reading. Sending max range = {current_cm} cm")
+
+            # 2) Build timestamp
             time_boot_ms = int(self.mav.time_since('SYSTEM_BOOT') * 1000)
 
-            # Send the MAVLink distance_sensor message
-            self.mav.mav.distance_sensor_send(
-                time_boot_ms,
-                self.min_distance_cm,
-                self.max_distance_cm,
-                dist_cm,
-                self.SENSOR_TYPE,
-                self.SENSOR_ID,
-                self.ROTATION_DOWNWARD,
-                self.COVARIANCE_UNKNOWN
-            )
-            print(f"[DistanceSensor] Sent DISTANCE_SENSOR message: {dist_cm} cm")
+            # 3) **Send using built-in helper**:
+            try:
+                self.mav.mav.distance_sensor_send(
+                    time_boot_ms,
+                    self.min_distance_cm,
+                    self.max_distance_cm,
+                    current_cm,
+                    self.SENSOR_TYPE,
+                    self.SENSOR_ID,
+                    self.ROTATION_DOWNWARD,
+                    self.COVARIANCE_UNKNOWN
+                )
+                print(f"[DistanceSensor] Sent DISTANCE_SENSOR message: {current_cm} cm")
+            except Exception as send_exc:
+                print(f"[DistanceSensor][ERROR] distance_sensor_send raised an exception:")
+                traceback.print_exc()
+                return
 
-            # Optional: capture any DISTANCE_SENSOR reply for confirmation
-            msg = self.mav.recv_match(type='DISTANCE_SENSOR', blocking=False)
-            if msg:
-                print(f"[DistanceSensor] FC reply: DISTANCE_SENSOR = {msg.current_distance} cm")
+            # 4) Wait up to 0.1 s for any FC echo:
+            msg_fb = None
+            try:
+                msg_fb = self.mav.recv_match(type='DISTANCE_SENSOR', blocking=True, timeout=0.1)
+            except Exception as recv_exc:
+                print(f"[DistanceSensor][ERROR] recv_match raised an exception:")
+                traceback.print_exc()
+
+            if msg_fb:
+                print(f"[DistanceSensor] FC reply: DISTANCE_SENSOR = {msg_fb.current_distance} cm")
+            else:
+                print("[DistanceSensor][ERROR] No DISTANCE_SENSOR reply from FC")
+
         except Exception as e:
             ts = datetime.datetime.now().isoformat()
-            print(f"[DistanceSensor][ERROR][{ts}] send failed: {e}\n{traceback.format_exc()}")
+            print(f"[DistanceSensor][ERROR][{ts}] Unexpected failure in send(): {e}")
+            traceback.print_exc()
 
 
 class ModeWatcher(threading.Thread):
@@ -158,7 +183,7 @@ class LandingMonitor:
          1. Compute distance from smoothed_det_obj (min z).
          2. Send distance to FC via distance_sender and log.
          3. After sending, read back any DISTANCE_SENSOR from FC, print it,
-            and if it equals max range (no data), report an error.
+            and if it equals max_range, report an error.
          4. If mode in ['LAND','RTL'], evaluate surface flatness.
              - If unsafe detected, record start time, send warning via MAVLink STATUSTEXT.
              - If unsafe persists beyond warning_duration, switch to LOITER.
@@ -173,7 +198,7 @@ class LandingMonitor:
             except Exception:
                 distance_m = None
 
-        # 2. Send distance sensor MAVLink every call
+        # 2. Send distance sensor MAVLink every call (rate-limited internally)
         self.distance_sender.send(distance_m)
 
         # 3. Read back any DISTANCE_SENSOR from FC and print it; if it equals max_range, report error
@@ -327,8 +352,8 @@ def _autopilot_reconnect_loop(finder):
                         mode_watcher = ModeWatcher(master)
                         mode_watcher.start()
 
-                        # DistanceSensorSender
-                        distance_sender = DistanceSensorSender(master)
+                        # DistanceSensorSender (10 Hz)
+                        distance_sender = DistanceSensorSender(master, min_range=0.05, max_range=5.0, send_rate_hz=10)
 
                         # LandingMonitor
                         landing_monitor = LandingMonitor(
@@ -370,6 +395,7 @@ if __name__ == "__main__":
 
     last_radar_time = 0
     RECONNECT_INTERVAL = 3.0
+    READ_TIMEOUT_THRESHOLD = 3.0  # if read_frame takes > 3 s, abort
 
     # Start background thread for autopilot reconnection
     _autopilot_stop = False
@@ -416,16 +442,22 @@ if __name__ == "__main__":
 
             # --- RADAR DATA ACQUISITION ---
             try:
+                start_read = time.time()
                 header, det_obj, snr, noise = radar.read_frame()
+                elapsed = time.time() - start_read
+                # If read_frame() took too long, treat as failure
+                if elapsed > READ_TIMEOUT_THRESHOLD:
+                    raise RuntimeError(f"read_frame throttled out after {elapsed:.1f}s")
+
                 last_radar_time = time.time()
-            except (serial.SerialException, SerialException) as e:
-                print(f"[Radar][Serial Error] {e.__class__.__name__}: {e}. Closing radar and restarting reconnection...")
+            except (serial.SerialException, SerialException, RuntimeError) as e:
+                print(f"[Radar][Serial/Timeout Error] {e.__class__.__name__}: {e}. Closing radar and restarting reconnection...")
                 maybe_traceback()
                 try:
                     radar.close()
-                    print("[Radar] Closed radar after SerialException.")
+                    print("[Radar] Closed radar after SerialException or timeout.")
                 except Exception as ce:
-                    print(f"[Radar] Exception during close after SerialException: {ce}")
+                    print(f"[Radar] Exception during close after SerialException or timeout: {ce}")
                 radar = None
                 continue  # go back to radar reconnect
             except Exception as e:
@@ -496,7 +528,7 @@ if __name__ == "__main__":
             # --- NEW: DISTANCE SENDING & LANDING MONITORING ---
             if mode_watcher and landing_monitor:
                 current_mode = mode_watcher.current_mode
-                # This call happens every iteration, so distance gets sent continuously:
+                # This call is invoked each iteration, but send() enforces 10 Hz
                 landing_monitor.update(smoothed_det_obj, m, current_mode)
 
             # gui.update_status(safe, m)

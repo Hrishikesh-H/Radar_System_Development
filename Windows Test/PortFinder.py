@@ -386,7 +386,11 @@ class DevicePortFinder:
         # Try UDP first
         try:
             self.log("INFO", f"Connecting to MAVLink on {udp_conn} …")
-            master = mavutil.mavlink_connection(udp_conn, source_system=255)
+            master = mavutil.mavlink_connection(
+                udp_conn,
+                source_system=255,
+                mavlink_version=1  # <<< Modified to force MAVLink 1.0 >>>
+            )
             self.log("INFO", "Waiting for MAVLink heartbeat …")
             hb = master.recv_match(type='HEARTBEAT', blocking=True, timeout=timeout)
             if hb:
@@ -420,7 +424,12 @@ class DevicePortFinder:
                 master = None
                 try:
                     self.log("INFO", f"Trying serial {port} @ {baud} baud …")
-                    master = mavutil.mavlink_connection(port, baud=baud, source_system=255)
+                    master = mavutil.mavlink_connection(
+                        port,
+                        baud=baud,
+                        source_system=255,
+                        mavlink_version=1  # <<< Modified to force MAVLink 1.0 >>>
+                    )
                     self.log("INFO", "Waiting for MAVLink heartbeat …")
                     hb = master.recv_match(type='HEARTBEAT', blocking=True, timeout=timeout)
                     if hb:
