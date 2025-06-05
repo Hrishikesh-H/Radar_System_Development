@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import QApplication
 from Parser import RadarParser
 from Filter import RadarDespiker
 # from Plotter import RadarPlotter
-from GUI import DroneLandingStatus
+# from GUI import DroneLandingStatus
 from PortFinder import DevicePortFinder
 from PlaneLand import LandingZoneAssessor
 from IMUCompensator import AttitudeCompensator
@@ -81,9 +81,9 @@ if __name__ == "__main__":
     despiker = RadarDespiker()
     assessor = LandingZoneAssessor(0.05, 500, 10, 0.7)
 
-    app = QApplication(sys.argv)
-    gui = DroneLandingStatus()
-    gui.show()
+    # app = QApplication(sys.argv)
+    # gui = DroneLandingStatus()
+    # gui.show()
 
     last_radar_time = 0
     RECONNECT_INTERVAL = 3.0
@@ -205,8 +205,8 @@ if __name__ == "__main__":
                         f"inliers={m.get('inlier_ratio',0)*100:.0f}%, res={m.get('mean_residual',0)*100:.1f}cm"
                     )
 
-            gui.update_status(safe, m)
-            app.processEvents()
+            # gui.update_status(safe, m)
+            # app.processEvents()
 
     except KeyboardInterrupt:
         print("[System] Interrupted by user. Exiting cleanly...")
