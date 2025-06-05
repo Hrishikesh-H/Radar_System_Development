@@ -341,6 +341,11 @@ import sys
 import datetime
 from serial.tools import list_ports
 from pymavlink import mavutil
+import platform
+import glob
+      
+     
+
 
 
 class DevicePortFinder:
@@ -377,6 +382,12 @@ class DevicePortFinder:
         return matches[0], matches[1]
 
     def find_autopilot_connection(self, timeout: float = 20.0, exclude_ports=None):
+        import os
+        import platform
+        import glob
+        from serial.tools import list_ports
+        from pymavlink import mavutil
+
         UDP_ADDR = "127.0.0.1"
         UDP_PORT = 14550
         udp_conn = f"udp:{UDP_ADDR}:{UDP_PORT}"
@@ -385,24 +396,24 @@ class DevicePortFinder:
 
         # Try UDP first
         try:
-            self.log("INFO", f"Connecting to MAVLink on {udp_conn} …")
+            self.log("INFO", "Connecting to MAVLink on {} ...".format(udp_conn))
             master = mavutil.mavlink_connection(
                 udp_conn,
                 source_system=255,
-                mavlink_version=1  # <<< Modified to force MAVLink 1.0 >>>
+                mavlink_version=1  # Modified to force MAVLink 1.0
             )
-            self.log("INFO", "Waiting for MAVLink heartbeat …")
+            self.log("INFO", "Waiting for MAVLink heartbeat ...")
             hb = master.recv_match(type='HEARTBEAT', blocking=True, timeout=timeout)
             if hb:
                 ap_t = hb.autopilot
                 ap_name = mavutil.mavlink.enums['MAV_AUTOPILOT'][ap_t].description
-                self.log("INFO", f"SUCCESS: autopilot via {udp_conn} → {ap_name}")
+                self.log("INFO", "SUCCESS: autopilot via {} -> {}".format(udp_conn, ap_name))
                 keep_master = True
                 return master, ap_name
             else:
-                self.log("WARN", f"No heartbeat on {udp_conn}")
+                self.log("WARN", "No heartbeat on {}".format(udp_conn))
         except Exception as e:
-            self.log("WARN", f"UDP connection failed: {e}")
+            self.log("WARN", "UDP connection failed: {}".format(e))
         finally:
             if master and not keep_master:
                 try:
@@ -411,37 +422,51 @@ class DevicePortFinder:
                     pass
 
         # Scan serial ports next
-        self.log("INFO", "Scanning serial ports…")
-        ports = [p for p in list_ports.comports() if exclude_ports is None or p.device not in exclude_ports]
+        self.log("INFO", "Scanning serial ports...")
 
-        if not ports:
-            self.log("INFO", "No ports detected—falling back to COM3–COM10")
-            ports = [type('P', (), {'device': f'COM{i}'}) for i in range(3, 11)]
+        ports = []
+        system_os = platform.system()
+
+        if system_os == "Windows":
+            ports = [p for p in list_ports.comports() if exclude_ports is None or p.device not in exclude_ports]
+            if not ports:
+                self.log("INFO", "No ports detected - falling back to COM3 to COM10")
+                ports = [type('P', (), {'device': 'COM{}'.format(i)}) for i in range(3, 11)]
+        else:
+            # Linux-compatible ports: USB, ACM, AMA, and S0
+            linux_port_patterns = ['/dev/ttyUSB*', '/dev/ttyACM*', '/dev/ttyAMA*', '/dev/ttyS0']
+            detected = []
+            for pattern in linux_port_patterns:
+                detected += glob.glob(pattern)
+            detected = sorted(set(detected))
+            if exclude_ports:
+                detected = [p for p in detected if p not in exclude_ports]
+            ports = [type('P', (), {'device': p}) for p in detected]
 
         for portinfo in ports:
             port = portinfo.device
             for baud in (9600, 57600, 115200):
                 master = None
                 try:
-                    self.log("INFO", f"Trying serial {port} @ {baud} baud …")
+                    self.log("INFO", "Trying serial {} @ {} baud ...".format(port, baud))
                     master = mavutil.mavlink_connection(
                         port,
                         baud=baud,
                         source_system=255,
-                        mavlink_version=1  # <<< Modified to force MAVLink 1.0 >>>
+                        mavlink_version=1  # Modified to force MAVLink 1.0
                     )
-                    self.log("INFO", "Waiting for MAVLink heartbeat …")
+                    self.log("INFO", "Waiting for MAVLink heartbeat ...")
                     hb = master.recv_match(type='HEARTBEAT', blocking=True, timeout=timeout)
                     if hb:
                         ap_t = hb.autopilot
                         ap_name = mavutil.mavlink.enums['MAV_AUTOPILOT'][ap_t].description
-                        self.log("INFO", f"SUCCESS: autopilot on {port}@{baud} → {ap_name}")
+                        self.log("INFO", "SUCCESS: autopilot on {}@{} -> {}".format(port, baud, ap_name))
                         keep_master = True
                         return master, ap_name
                     else:
-                        self.log("WARN", f"No heartbeat on {port}@{baud}")
+                        self.log("WARN", "No heartbeat on {}@{}".format(port, baud))
                 except Exception as e:
-                    self.log("WARN", f"Error opening {port}@{baud}: {e}")
+                    self.log("WARN", "Error opening {}@{}: {}".format(port, baud, e))
                 finally:
                     if master and not keep_master:
                         try:
@@ -449,6 +474,7 @@ class DevicePortFinder:
                         except Exception:
                             pass
 
-        # If we reach here, no connection was found
         self.log("ERROR", "No PX4/ArduPilot heartbeat detected on UDP or any serial port.")
         return None, None
+
+

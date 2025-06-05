@@ -9,6 +9,7 @@ import numpy as np
 from collections import deque
 from PyQt6.QtWidgets import QApplication
 from pymavlink import mavutil
+from serial.serialutil import SerialException
 
 #--------------------------------------------------------
 from Parser import RadarParser
@@ -18,9 +19,12 @@ from Filter import RadarDespiker
 from PortFinder import DevicePortFinder
 from PlaneLand import LandingZoneAssessor
 from IMUCompensator import AttitudeCompensator
-from serial.serialutil import SerialException
 
 # ============================ NEW CLASSES ============================
+
+# If you don’t already have a debug_print, you can define it like:
+# def debug_print(msg):
+#     print(msg)
 
 class DistanceSensorSender:
     """
@@ -50,7 +54,7 @@ class DistanceSensorSender:
         """
         Send a DISTANCE_SENSOR message at up to the configured rate.
         Uses the helper .distance_sensor_send() to guarantee correct MAVLink 1.0 formatting.
-        Prints traceback if send fails.
+        Prints traceback if send fails, and dumps raw bytes before sending.
         """
         now = time.time()
         if (now - self._last_send_time) < self.send_interval:
@@ -63,50 +67,68 @@ class DistanceSensorSender:
             if distance_m is not None and isinstance(distance_m, (int, float)):
                 raw_cm = int(round(distance_m * 100))
                 clamped_cm = max(self.min_distance_cm, min(raw_cm, self.max_distance_cm))
-                print(f"[DistanceSensor] Raw distance = {distance_m:.3f} m → {raw_cm} cm, Clamped → {clamped_cm} cm")
                 current_cm = clamped_cm
             else:
                 current_cm = self.max_distance_cm
-                print(f"[DistanceSensor] No valid radar reading. Sending max range = {current_cm} cm")
 
-            # 2) Build timestamp
+            # 2) Build timestamp for debug messages
+            ts = datetime.datetime.now().isoformat()
+            print(f"[{ts}] [DEBUG] Raw distance = {distance_m:.3f} m → {current_cm} cm")
+            print(f"[{ts}] [DEBUG] Clamping distance between {self.min_distance_cm} and {self.max_distance_cm} cm")
+
+            # 3) Build time_boot_ms
             time_boot_ms = int(self.mav.time_since('SYSTEM_BOOT') * 1000)
+            if time_boot_ms <= 0:
+                print(f"[{ts}] [WARNING] time_boot_ms={time_boot_ms} (is FC time_since('SYSTEM_BOOT') working?).")
 
-            # 3) **Send using built-in helper**:
+            # 4) Confirm target_system & component
+            tsys = getattr(self.mav, 'target_system', None)
+            tcomp = getattr(self.mav, 'target_component', None)
+            if (tsys is None) or (tcomp is None) or (tsys == 0) or (tcomp == 0):
+                print(f"[{ts}] [ERROR] INVALID target_system/component: {tsys}/{tcomp}")
+                # We can still attempt to send, but likely FC will ignore it.
+            
+            # 5) Manually encode the message so we can show raw bytes
+            msg = self.mav.mav.distance_sensor_encode(
+                time_boot_ms,
+                self.min_distance_cm,
+                self.max_distance_cm,
+                current_cm,
+                self.SENSOR_TYPE,
+                self.SENSOR_ID,
+                self.ROTATION_DOWNWARD,
+                self.COVARIANCE_UNKNOWN
+            )
+            raw = msg.pack(self.mav.mav)    # This is the byte‐string that will be written to UART/UDP
+            hex_dump = raw.hex(' ')
+            print(f"[{ts}] [DEBUG] → RAW MAVLINK DISTANCE_SENSOR: {hex_dump}")
+
+            # Now actually send it (helper does the same under the hood, but we've already packed it)
             try:
-                self.mav.mav.distance_sensor_send(
-                    time_boot_ms,
-                    self.min_distance_cm,
-                    self.max_distance_cm,
-                    current_cm,
-                    self.SENSOR_TYPE,
-                    self.SENSOR_ID,
-                    self.ROTATION_DOWNWARD,
-                    self.COVARIANCE_UNKNOWN
-                )
-                print(f"[DistanceSensor] Sent DISTANCE_SENSOR message: {current_cm} cm")
-            except Exception as send_exc:
-                print(f"[DistanceSensor][ERROR] distance_sensor_send raised an exception:")
+                self.mav.write(raw)
+                print(f"[{ts}] [DEBUG] distance_sensor packet written to MAVLink channel")
+            except Exception as write_exc:
+                print(f"[{ts}] [ERROR] MAVLink write(raw) raised an exception:")
                 traceback.print_exc()
                 return
 
-            # 4) Wait up to 0.1 s for any FC echo:
-            msg_fb = None
+            # 6) Optional feedback: wait briefly to see if FC echoes it back
             try:
-                msg_fb = self.mav.recv_match(type='DISTANCE_SENSOR', blocking=True, timeout=0.1)
+                # Use a small blocking timeout (200 ms) so we do catch an echo if it does come
+                msg_fb = self.mav.recv_match(type='DISTANCE_SENSOR', blocking=True, timeout=0.2)
+                if msg_fb:
+                    print(f"[{ts}] [DEBUG] FC reply: DISTANCE_SENSOR = {msg_fb.current_distance} cm")
+                else:
+                    print(f"[{ts}] [DEBUG] No reply from FC after distance_sensor_send "
+                          "(this is normal on most firmwares)")
             except Exception as recv_exc:
-                print(f"[DistanceSensor][ERROR] recv_match raised an exception:")
+                print(f"[{ts}] [ERROR] recv_match raised an exception:")
                 traceback.print_exc()
-
-            if msg_fb:
-                print(f"[DistanceSensor] FC reply: DISTANCE_SENSOR = {msg_fb.current_distance} cm")
-            else:
-                print("[DistanceSensor][ERROR] No DISTANCE_SENSOR reply from FC")
 
         except Exception as e:
             ts = datetime.datetime.now().isoformat()
-            print(f"[DistanceSensor][ERROR][{ts}] Unexpected failure in send(): {e}")
-            traceback.print_exc()
+            print(f"[{ts}] [ERROR] send() failed: {e}\n{traceback.format_exc()}")
+
 
 
 class ModeWatcher(threading.Thread):
@@ -142,36 +164,56 @@ class ModeWatcher(threading.Thread):
 class LandingMonitor:
     """
     Evaluates landing surface flatness over recent frames and issues warnings/aborts if unsafe.
-    - Buffers recent slope and inlier_ratio values.
-    - Determines 'flat' if median slope < slope_threshold AND median inlier_ratio > inlier_threshold.
-    - When in LAND or RTL mode, continuously sends distance sensor and checks surface:
-        * If unsafe for more than warning_duration seconds, abort landing (switch to LOITER).
-        * Otherwise, if returns to safe before timeout, cancel abort.
-    Additionally prints debug information, reads back the FC’s reported distance after sending,
-    and reports an error if the FC shows no data.
+    - Buffers recent slope and inlier_ratio values (for median).
+    - Also buffers a history of frame-by-frame safety decisions (booleans) for hysteresis.
+    - If median slope < threshold AND median inlier > threshold → frame classified as SAFE.
+      Otherwise → frame classified as UNSAFE.
+    - If fewer than 3 points are detected in a frame, that frame is immediately classified as UNSAFE.
+    - Only when UNSAFE persists for more than warning_duration does a warning/abort occur.
+    - Once warned, landing_disable persists until a number of consecutive SAFE frames clears it.
     """
     def __init__(self, mav, distance_sender,
-                 buffer_size=10,
+                 buffer_size=20,
                  slope_threshold_deg=5.0,
                  inlier_threshold=0.6,
-                 warning_duration=3.0):
+                 warning_duration=3.0,
+                 min_consecutive_to_warn=5,
+                 min_consecutive_to_clear=5):
         """
         mav: pymavlink connection
         distance_sender: DistanceSensorSender instance
-        buffer_size: how many past frames to use
-        slope_threshold_deg: max median slope (degrees) to consider flat
-        inlier_threshold: min median inlier_ratio to consider flat
-        warning_duration: seconds to wait before aborting landing if unsafe
+        buffer_size: maxlen for slope & inlier buffering for median
+        slope_threshold_deg: maximum median slope (degrees) to treat frame as SAFE
+        inlier_threshold: minimum median inlier_ratio to treat frame as SAFE
+        warning_duration: seconds UNSAFE must persist before aborting landing
+        min_consecutive_to_warn: number of consecutive UNSAFE frames before starting warning timer
+        min_consecutive_to_clear: number of consecutive SAFE frames to clear an active warning
         """
         self.mav = mav
         self.distance_sender = distance_sender
+
+        # Buffers for raw slopes & inliers (for median calculation)
         self.slope_buffer = deque(maxlen=buffer_size)
         self.inlier_buffer = deque(maxlen=buffer_size)
+
+        # History of frame safety decisions: True = frame was SAFE, False = frame was UNSAFE
+        self.safety_history = deque(maxlen=buffer_size)
+
         self.threshold_slope = slope_threshold_deg
         self.threshold_inlier = inlier_threshold
         self.warning_duration = warning_duration
-        self.unsafe_start_time = None
-        self.abort_issued = False
+
+        # Hysteresis: how many consecutive UNSAFE to actually begin warning timer,
+        # and how many consecutive SAFE to clear an active warning/abort.
+        self.min_consecutive_to_warn = min_consecutive_to_warn
+        self.min_consecutive_to_clear = min_consecutive_to_clear
+
+        # State variables
+        self.unsafe_start_time = None     # when continuous UNSAFE streak began
+        self.abort_issued = False         # whether abort (LOITER change) has already been sent
+        self.currently_warned = False     # whether we are in “warning” state (but not yet abort)
+        self.consec_unsafe_count = 0      # how many frames in a row have been classified UNSAFE
+        self.consec_safe_count = 0        # how many frames in a row have been classified SAFE
 
     def update(self, smoothed_det_obj, assessment_result, mode):
         """
@@ -181,14 +223,17 @@ class LandingMonitor:
         - mode: current flight mode string
         Behavior:
          1. Compute distance from smoothed_det_obj (min z).
-         2. Send distance to FC via distance_sender and log.
-         3. After sending, read back any DISTANCE_SENSOR from FC, print it,
-            and if it equals max_range, report an error.
-         4. If mode in ['LAND','RTL'], evaluate surface flatness.
-             - If unsafe detected, record start time, send warning via MAVLink STATUSTEXT.
-             - If unsafe persists beyond warning_duration, switch to LOITER.
-             - If returns safe before warning_duration, clear timers.
-         5. Print debug info: raw slope & inlier each frame, median when available.
+         2. Send distance to FC via distance_sender.
+         3. Read back any DISTANCE_SENSOR from FC; if it equals max_range → send error STATUSTEXT.
+         4. If mode in ['LAND','RTL'], classify the current frame as SAFE or UNSAFE:
+             - If fewer than 3 points: UNSAFE (sparse data).
+             - Else compute median_slope & median_inlier from buffers; if 
+               median_slope < threshold_slope AND median_inlier > threshold_inlier ⇒ SAFE; else UNSAFE.
+           Maintain hysteresis counters (consec_unsafe_count, consec_safe_count).
+           * Once consec_unsafe_count ≥ min_consecutive_to_warn ⇒ start warning timer (if not already).
+           * If warning timer elapses beyond warning_duration ⇒ abort (LOITER).
+           * If warned/aborted, only clear state when consec_safe_count ≥ min_consecutive_to_clear.
+         5. Print debug info each frame.
         """
         # 1. Compute distance (in meters) as minimum z value if available
         distance_m = None
@@ -220,49 +265,95 @@ class LandingMonitor:
 
         # 4. Landing/RTL specific logic
         if mode is None:
+            # If we don’t know the mode, just reset all landing checks
+            self._reset_state()
             return
 
         mode_upper = mode.upper()
-        # Debug: print raw slope and inlier if available
-        slope_raw = assessment_result.get('slope_deg', None)
-        inlier_raw = assessment_result.get('inlier_ratio', None)
-        if slope_raw is not None and inlier_raw is not None:
-            print(f"[LandingMonitor] Debug raw – Slope: {slope_raw:.2f}°, Inlier: {inlier_raw:.2f}")
 
-        if 'LAND' in mode_upper or 'RTL' in mode_upper:
-            if slope_raw is not None and inlier_raw is not None:
-                self.slope_buffer.append(slope_raw)
-                self.inlier_buffer.append(inlier_raw)
+        # We only activate landing checks while in LAND or RTL
+        if ('LAND' in mode_upper) or ('RTL' in mode_upper):
+            # STEP A: Classify the current frame as SAFE or UNSAFE
+            num_points = smoothed_det_obj.get('numObj', 0)
+            frame_is_safe = False
 
-            if len(self.slope_buffer) >= self.slope_buffer.maxlen:
-                median_slope = np.median(np.array(self.slope_buffer))
-                median_inlier = np.median(np.array(self.inlier_buffer))
-                flat = (median_slope < self.threshold_slope) and (median_inlier > self.threshold_inlier)
-                print(f"[LandingMonitor] Median slope: {median_slope:.2f}°, "
-                      f"Median inlier: {median_inlier:.2f}, Flat={flat}")
+            # If fewer than 3 points, treat as UNSAFE immediately
+            if num_points < 3:
+                frame_is_safe = False
+                print(f"[LandingMonitor] Frame has only {num_points} point(s) → classifying as UNSAFE (sparse).")
             else:
-                flat = True
-                print(f"[LandingMonitor] Not enough data for median; assuming flat.")
+                # Buffer raw slope & inlier
+                slope_raw = assessment_result.get('slope_deg', None)
+                inlier_raw = assessment_result.get('inlier_ratio', None)
+                if (slope_raw is None) or (inlier_raw is None):
+                    # If somehow assessment_result is missing data, treat as UNSAFE
+                    frame_is_safe = False
+                    print("[LandingMonitor] Missing slope/inlier → classifying as UNSAFE.")
+                else:
+                    self.slope_buffer.append(slope_raw)
+                    self.inlier_buffer.append(inlier_raw)
 
-            if not flat:
-                now = time.time()
+                    # Once our buffers are full enough, compute medians
+                    if (len(self.slope_buffer) == self.slope_buffer.maxlen) and \
+                       (len(self.inlier_buffer) == self.inlier_buffer.maxlen):
+                        median_slope = float(np.median(np.array(self.slope_buffer)))
+                        median_inlier = float(np.median(np.array(self.inlier_buffer)))
+                        frame_is_safe = (median_slope < self.threshold_slope) and (median_inlier > self.threshold_inlier)
+                        print(f"[LandingMonitor] Median slope = {median_slope:.2f}°, "
+                              f"Median inlier = {median_inlier:.2f} → "
+                              f"{'SAFE' if frame_is_safe else 'UNSAFE'}")
+                    else:
+                        # Not enough data to form a reliable median → treat conservatively as UNSAFE
+                        frame_is_safe = False
+                        print(f"[LandingMonitor] Buffers not yet full (size={len(self.slope_buffer)}) → "
+                              "classifying as UNSAFE until buffer fills.")
+            
+            # STEP B: Update hysteresis counters
+            if frame_is_safe:
+                self.consec_safe_count += 1
+                self.consec_unsafe_count = 0
+            else:
+                self.consec_unsafe_count += 1
+                self.consec_safe_count = 0
+
+            # Append to safety_history for reference (not used directly for median)
+            self.safety_history.append(frame_is_safe)
+
+            # STEP C: If we have a run of UNSAFE frames, possibly start warning timer
+            if (self.consec_unsafe_count >= self.min_consecutive_to_warn) and (not self.currently_warned):
+                # Start warning timer on first qualifying frame
                 if self.unsafe_start_time is None:
-                    self.unsafe_start_time = now
-                    self.send_warning("Landing surface unsafe: non-flat detected. Please relocate.")
-                elif not self.abort_issued and (now - self.unsafe_start_time) > self.warning_duration:
-                    self.send_abort_and_loiter()
-                    self.abort_issued = True
-            else:
-                self.unsafe_start_time = None
-                self.abort_issued = False
-        else:
-            self.unsafe_start_time = None
-            self.abort_issued = False
+                    self.unsafe_start_time = time.time()
+                    print(f"[LandingMonitor] Detected {self.consec_unsafe_count} consecutive UNSAFE frames; "
+                          f"starting warning timer at t={self.unsafe_start_time:.2f}")
 
-    def send_warning(self, text):
+                # If warning timer has elapsed warning_duration, we abort
+                else:
+                    elapsed = time.time() - self.unsafe_start_time
+                    if elapsed >= self.warning_duration:
+                        if not self.abort_issued:
+                            self._issue_abort()
+                            self.abort_issued = True
+
+                        # If we already aborted, we stay aborted; no further action needed here
+            else:
+                # Either not enough consecutive UNSAFE frames or already warned/aborted
+                pass
+
+            # STEP D: If we are currently warned/aborted, look for a run of SAFE frames to clear state
+            if self.currently_warned or self.abort_issued:
+                if self.consec_safe_count >= self.min_consecutive_to_clear:
+                    # Clear warning/abort state
+                    print(f"[LandingMonitor] Detected {self.consec_safe_count} consecutive SAFE frames; clearing warnings/abort.")
+                    self._reset_state()
+
+        else:
+            # Not in LAND or RTL: reset any timers/counters
+            self._reset_state()
+
+    def _issue_warning(self, text):
         """
-        Send a MAVLink STATUSTEXT with severity WARNING (3).
-        Also print to console.
+        Send a MAVLink STATUSTEXT with severity WARNING (3) and print to console.
         """
         severity = mavutil.mavlink.MAV_SEVERITY_WARNING
         try:
@@ -271,19 +362,22 @@ class LandingMonitor:
             print(f"[LandingMonitor][ERROR] Unable to send STATUSTEXT: {e}")
         print(f"[LandingMonitor][WARNING] {text}")
 
-    def send_abort_and_loiter(self):
+    def _issue_abort(self):
         """
-        Abort landing by commanding flight mode change to LOITER.
-        Sends a MAV_CMD_DO_SET_MODE command_long.
+        Abort landing by changing mode to LOITER and send a STATUSTEXT explaining the reason.
         """
+        reason = "Landing unsafe: aborting and switching to LOITER. Please relocate to a flat area."
+        print(f"[LandingMonitor] Aborting landing now (switching to LOITER).")
+        # First attempt high-level set_mode_loiter()
         try:
             self.mav.set_mode_loiter()
-            self.send_warning("Landing aborted: switching to LOITER. Please relocate and try again.")
+            self._issue_warning(reason)
         except Exception:
+            # Fallback to direct COMMAND_LONG if set_mode_loiter isn't available
             try:
                 DO_SET_MODE = mavutil.mavlink.MAV_CMD_DO_SET_MODE
                 MAV_MODE_FLAG_AUTO_ENABLED = mavutil.mavlink.MAV_MODE_FLAG_AUTO_ENABLED
-                custom_mode_loiter = 2  # ArduPilot LOITER mode
+                custom_mode_loiter = 2  # ArduPilot LOITER mode index
                 self.mav.mav.command_long_send(
                     self.mav.target_system,
                     self.mav.target_component,
@@ -293,9 +387,32 @@ class LandingMonitor:
                     custom_mode_loiter,
                     0, 0, 0, 0, 0
                 )
-                self.send_warning("Landing aborted: commanded LOITER via COMMAND_LONG. Please relocate and try again.")
+                self._issue_warning(reason)
             except Exception as e2:
                 print(f"[LandingMonitor][ERROR] Failed to switch to LOITER: {e2}")
+        # Mark that we have issued an abort
+        self.abort_issued = True
+        self.currently_warned = True
+
+    def send_warning(self, text):
+        """
+        External method to send a STATUSTEXT WARNING immediately.
+        """
+        self._issue_warning(text)
+
+    def _reset_state(self):
+        """
+        Reset all hysteresis and timer states.
+        """
+        self.slope_buffer.clear()
+        self.inlier_buffer.clear()
+        self.safety_history.clear()
+        self.unsafe_start_time = None
+        self.abort_issued = False
+        self.currently_warned = False
+        self.consec_safe_count = 0
+        self.consec_unsafe_count = 0
+
 
 # ========================= END NEW CLASSES ==========================
 
@@ -355,14 +472,16 @@ def _autopilot_reconnect_loop(finder):
                         # DistanceSensorSender (10 Hz)
                         distance_sender = DistanceSensorSender(master, min_range=0.05, max_range=5.0, send_rate_hz=10)
 
-                        # LandingMonitor
+                        # LandingMonitor with more robust logic
                         landing_monitor = LandingMonitor(
                             master,
                             distance_sender,
-                            buffer_size=10,
+                            buffer_size=20,
                             slope_threshold_deg=5.0,
                             inlier_threshold=0.6,
-                            warning_duration=3.0
+                            warning_duration=3.0,
+                            min_consecutive_to_warn=5,
+                            min_consecutive_to_clear=5
                         )
                 time.sleep(reconnect_interval)
             except Exception as e:
