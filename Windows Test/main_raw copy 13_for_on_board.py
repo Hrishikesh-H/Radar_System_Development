@@ -164,6 +164,11 @@ if __name__ == "__main__":
 
                 if compensator:
                     try:
+                        if calli_req:  
+                                # Call calibration once
+                                compensator.internal_calibrate_offsets(num_samples=100, delay=0.01) # Replace with your actual calibration method name
+                                calli_req = False  # Reset after one call
+
                         pts_enu = compensator.transform_pointcloud(pts_body)
                         last_att_time = time.time()
                     except Exception as e:
