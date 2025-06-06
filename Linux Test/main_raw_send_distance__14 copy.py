@@ -2,17 +2,17 @@ import os
 import sys
 import time
 import serial
+import struct
 import threading
 import traceback
 import datetime
 import numpy as np
 from collections import deque
-# from PyQt6.QtWidgets import QApplication
 from pymavlink import mavutil
 from serial.serialutil import SerialException
 
 #--------------------------------------------------------
-from Parser import RadarParser
+from Parser import RadarParser  # We will overwrite this class below
 from Filter import RadarDespiker
 # from Plotter import RadarPlotter
 # from GUI import DroneLandingStatus
@@ -20,11 +20,7 @@ from PortFinder import DevicePortFinder
 from PlaneLand import LandingZoneAssessor
 from IMUCompensator import AttitudeCompensator
 
-# ============================ NEW CLASSES ============================
-
-# If you don't already have a debug_print, you can define it like:
-# def debug_print(msg):
-#     print(msg)
+# ============================ DistanceSensorSender ============================
 
 class DistanceSensorSender:
     """
@@ -74,7 +70,7 @@ class DistanceSensorSender:
             # 2) Build timestamp for debug messages
             ts = datetime.datetime.now().isoformat()
 
-            # Replace the old formatting with a safe check for None
+            # Safe formatting for distance_m (None or float)
             if distance_m is None:
                 distance_str = "None"
             else:
@@ -92,7 +88,17 @@ class DistanceSensorSender:
             tcomp = getattr(self.mav, 'target_component', None)
             if (tsys is None) or (tcomp is None) or (tsys == 0) or (tcomp == 0):
                 print(f"[{ts}] [ERROR] INVALID target_system/component: {tsys}/{tcomp}")
-                # We can still attempt to send, but FC may ignore it.
+                # If tcomp == 0, wait up to 0.5 seconds for a heartbeat
+                if tcomp == 0:
+                    start_hb_wait = time.time()
+                    while (self.mav.target_component == 0) and (time.time() - start_hb_wait < 0.5):
+                        hb = self.mav.recv_match(type='HEARTBEAT', blocking=True, timeout=0.1)
+                        if hb:
+                            continue
+                    tcomp = self.mav.target_component
+                    if tcomp == 0:
+                        print(f"[{ts}] [ERROR] Still no valid target_component after waiting. Aborting send().")
+                        return
 
             # 5) Encode the message so we can show raw bytes
             msg = self.mav.mav.distance_sensor_encode(
@@ -118,22 +124,25 @@ class DistanceSensorSender:
                 traceback.print_exc()
                 return
 
-            # 6) Optional feedback: wait briefly for any echo
+            # 6) Optional feedback: use non-blocking recv_match to avoid SerialException
             try:
-                # Use a small blocking timeout (200 ms) to catch an echo if it arrives
-                msg_fb = self.mav.recv_match(type='DISTANCE_SENSOR', blocking=True, timeout=0.2)
+                msg_fb = self.mav.recv_match(type='DISTANCE_SENSOR', blocking=False)
                 if msg_fb:
                     print(f"[{ts}] [DEBUG] FC reply: DISTANCE_SENSOR = {msg_fb.current_distance} cm")
                 else:
-                    print(f"[{ts}] [DEBUG] No reply from FC after distance_sensor_send (normal on most firmwares)")
-            except Exception as recv_exc:
-                print(f"[{ts}] [ERROR] recv_match raised an exception:")
+                    # On many firmwares, DISTANCE_SENSOR is not echoed back
+                    pass
+            except SerialException as ser_e:
+                print(f"[{ts}] [ERROR] SerialException in non-blocking recv_match: {ser_e}")
+            except Exception as e:
+                print(f"[{ts}] [ERROR] Unexpected exception in recv_match: {e}")
                 traceback.print_exc()
 
         except Exception as e:
             ts = datetime.datetime.now().isoformat()
             print(f"[{ts}] [ERROR] send() failed: {e}\n{traceback.format_exc()}")
 
+# ============================ ModeWatcher ============================
 
 class ModeWatcher(threading.Thread):
     """
@@ -164,6 +173,7 @@ class ModeWatcher(threading.Thread):
     def stop(self):
         self._stop_event.set()
 
+# ============================ LandingMonitor ============================
 
 class LandingMonitor:
     """
@@ -404,10 +414,73 @@ class LandingMonitor:
         self.consec_safe_count = 0
         self.consec_unsafe_count = 0
 
+# ============================ ENABLE_TRACE ============================
 
-# ========================= END NEW CLASSES ==========================
+ENABLE_TRACE = False
 
-# main_application.py
+def maybe_traceback():
+    if ENABLE_TRACE:
+        traceback.print_exc()
+
+# ============================ RadarManager (Background) ============================
+
+class RadarManager(threading.Thread):
+    """
+    Background thread that handles radar connection and reconnection.
+    Maintains a shared global 'radar' reference, 'cli', 'data', and 'last_radar_time'.
+    For Linux, uses explicit device paths /dev/ttyUSB0 and /dev/ttyUSB1 to mirror the working reference code.
+    """
+    def __init__(self, finder, despiker, assessor):
+        super().__init__(daemon=True)
+        self.finder = finder
+        self.despiker = despiker
+        self.assessor = assessor
+        self._stop_event = threading.Event()
+
+    def run(self):
+        global radar, cli, data, last_radar_time
+        RECONNECT_INTERVAL = 3.0
+
+        while not self._stop_event.is_set():
+            now = time.time()
+            # Attempt to connect if radar is None or closed or stale
+            if radar is None or not getattr(radar, 'data_serial', None) or not radar.data_serial.is_open or (now - last_radar_time > 5.0):
+                if radar:
+                    try:
+                        radar.close()
+                        print(f"[{datetime.datetime.now().isoformat()}] [Radar] Closed existing radar instance.")
+                    except Exception as e:
+                        print(f"[{datetime.datetime.now().isoformat()}] [Radar] Error during close: {e}")
+                    radar = None
+                    print(f"[{datetime.datetime.now().isoformat()}] [Radar] Restarting radar connection.")
+
+                print(f"[{datetime.datetime.now().isoformat()}] [Radar] Attempting to reconnect...")
+                try:
+                    # For Linux, use fixed device names that are known to work:
+                    cli = "/dev/ttyUSB0"
+                    data = "/dev/ttyUSB1"
+                    print(f"[{datetime.datetime.now().isoformat()}] [Radar] Using CLI={cli}, DATA={data}")
+                    config_path = os.path.join(os.getcwd(), "best_res_4cm.cfg")
+                    radar = RadarParser(cli, data, config_path, debug=True, enable_logging=False, log_prefix="radar_log")
+                    radar.initialize_ports()
+                    radar.send_config()
+                    print(f"[{datetime.datetime.now().isoformat()}] [Radar] Sleeping 2 seconds to allow radar to initialize and stream data.")
+                    time.sleep(2)
+                    radar.info_print("Connected to radar successfully (Linux).")
+                    last_radar_time = time.time()
+                except Exception as e:
+                    current_time = time.strftime("%Y-%m-%d %H:%M:%S")
+                    print(f"[Radar][Connection Error] {e.__class__.__name__}: {e} | Time: {current_time}")
+                    time.sleep(RECONNECT_INTERVAL)
+                    continue
+            else:
+                # Already connected and fresh enough
+                time.sleep(0.1)
+
+    def stop(self):
+        self._stop_event.set()
+
+# ============================ main_application.py ============================
 
 # Shared state for autopilot
 compensator = None
@@ -415,7 +488,9 @@ last_att_time = 0
 _autopilot_stop = False
 calli_req = True  # Set True once here for a single calibration call
 
-# Radar port names, to avoid scanning them
+# Radar shared state (managed by RadarManager thread)
+radar = None
+last_radar_time = 0
 cli = None
 data = None
 
@@ -476,36 +551,22 @@ def _autopilot_reconnect_loop(finder):
                         )
                 time.sleep(reconnect_interval)
             except Exception as e:
-                print(f"[Autopilot] Background reconnect failed: {e}. Retrying in {reconnect_interval:.1f}sec")
+                print(f"[Autopilot] Background reconnect failed: {e}. Retrying in {reconnect_interval:.1f}s")
                 traceback.print_exc()
                 time.sleep(reconnect_interval)
         else:
             time.sleep(reconnect_interval)
 
-
-# Add this constant at the top of the file
-ENABLE_TRACE = False
-
-def maybe_traceback():
-    if ENABLE_TRACE:
-        traceback.print_exc()
-
 if __name__ == "__main__":
     finder = DevicePortFinder()
-    radar = None
-    # cli and data will be set after radar connects once
-
-    # plotter = RadarPlotter()
     despiker = RadarDespiker()
     assessor = LandingZoneAssessor(0.05, 500, 10, 0.7)
 
-    # app = QApplication(sys.argv)
-    # gui = DroneLandingStatus()
-    # gui.show()
+    print(f"[{datetime.datetime.now().isoformat()}] [MAIN] Starting up, attempting to connect to Radar.")
 
-    last_radar_time = 0
-    RECONNECT_INTERVAL = 3.0
-    READ_TIMEOUT_THRESHOLD = 3.0  # if read_frame takes > 3 s, abort
+    # Start background thread for radar reconnection
+    radar_manager = RadarManager(finder, despiker, assessor)
+    radar_manager.start()
 
     # Start background thread for autopilot reconnection
     _autopilot_stop = False
@@ -516,154 +577,129 @@ if __name__ == "__main__":
         while True:
             now = time.time()
 
-            # --- RADAR RECONNECTION LOGIC ---
-            if radar is None or not radar.data_serial or not radar.data_serial.is_open or (now - last_radar_time > 5.0):
-                if radar:
+            # --- RADAR DATA ACQUISITION (main loop only reads data if radar is connected) ---
+            if radar:
+                try:
+                    start_read = time.time()
+                    header, det_obj, snr, noise = radar.read_frame()
+                    elapsed = time.time() - start_read
+
+                    if elapsed > 10.0:
+                        raise RuntimeError(f"read_frame took {elapsed:.2f}s, exceeding threshold")
+
+                    if header is None:
+                        # No complete frame yet; loop back
+                        continue
+
+                    last_radar_time = time.time()
+                except (serial.SerialException, SerialException, RuntimeError) as e:
+                    print(f"[{datetime.datetime.now().isoformat()}] [Radar][Serial/Timeout Error] {e.__class__.__name__}: {e}")
                     try:
                         radar.close()
-                        print("[Radar] Closed existing radar instance.")
-                    except Exception as e:
-                        print(f"[Radar] Error during radar close: {e}")
+                        print(f"[{datetime.datetime.now().isoformat()}] [Radar] Closed radar after error.")
+                    except Exception as ce:
+                        print(f"[{datetime.datetime.now().isoformat()}] [Radar] Close error: {ce}")
                     radar = None
-                    print("[Radar] Previous connection closed due to timeout or error.")
-
-                print("[Radar] Connection required -- attempting to reconnect...")
-                try:
-                    cli, data = finder.find_radar_ports_by_description()
-                    config_path = os.path.join(os.getcwd(), "best_res_4cm.cfg")
-                    radar = RadarParser(cli, data, config_path, debug=False, enable_logging=False, log_prefix="radar_log")
-                    radar.initialize_ports()
-                    radar.send_config()
-                    time.sleep(2)
-                    radar.info_print("Connected to radar successfully.")
-                    last_radar_time = time.time()
-                except RuntimeError as e:
-                    current_time = time.strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[Radar][Port Detection Error] {e.__class__.__name__}: {e} | Time: {current_time} | Ports Found: {getattr(e, 'matches', 'unknown')} | Type: RuntimeError. Retrying in {RECONNECT_INTERVAL:.1f}s...")
-                    maybe_traceback()
-                    time.sleep(RECONNECT_INTERVAL)
                     continue
                 except Exception as e:
-                    current_time = time.strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[Radar][Unknown Connection Error] {e.__class__.__name__}: {e} | Time: {current_time}. Retrying in {RECONNECT_INTERVAL:.1f}s...")
-                    maybe_traceback()
-                    time.sleep(RECONNECT_INTERVAL)
-                    continue  # skip downstream until radar returns
-
-            # --- RADAR DATA ACQUISITION ---
-            try:
-                start_read = time.time()
-                header, det_obj, snr, noise = radar.read_frame()
-                elapsed = time.time() - start_read
-                # If read_frame() took too long, treat as failure
-                if elapsed > READ_TIMEOUT_THRESHOLD:
-                    raise RuntimeError(f"read_frame throttled out after {elapsed:.1f}s")
-
-                last_radar_time = time.time()
-            except (serial.SerialException, SerialException, RuntimeError) as e:
-                print(f"[Radar][Serial/Timeout Error] {e.__class__.__name__}: {e}. Closing radar and restarting reconnection...")
-                maybe_traceback()
-                try:
-                    radar.close()
-                    print("[Radar] Closed radar after SerialException or timeout.")
-                except Exception as ce:
-                    print(f"[Radar] Exception during close after SerialException or timeout: {ce}")
-                radar = None
-                continue  # go back to radar reconnect
-            except Exception as e:
-                print(f"[Radar][Frame Read Error] {e.__class__.__name__}: {e}. Closing radar instance and restarting reconnection...")
-                maybe_traceback()
-                try:
-                    radar.close()
-                    print("[Radar] Closed radar after general read failure.")
-                except Exception as ce:
-                    print(f"[Radar] Exception during close after general failure: {ce}")
-                radar = None
-                continue  # go back to radar reconnect
-
-            # --- POINT PROCESSING AND COMPENSATION ---
-            smoothed_det_obj = {'x': [], 'y': [], 'z': [], 'numObj': 0}
-            if det_obj and det_obj.get('numObj', 0) >= 3:
-                spr = despiker.process(det_obj, snr, noise)
-                pts_body = np.vstack((spr['x'], spr['y'], spr['z'])).T
-
-                if compensator:
+                    print(f"[{datetime.datetime.now().isoformat()}] [Radar][Frame Read Error] {e.__class__.__name__}: {e}")
                     try:
-                        if calli_req:
-                            # Call calibration once
-                            compensator.internal_calibrate_offsets(num_samples=100, delay=0.01)
-                            calli_req = False  # Reset after one call
+                        radar.close()
+                        print(f"[{datetime.datetime.now().isoformat()}] [Radar] Closed radar after general failure.")
+                    except Exception as ce:
+                        print(f"[{datetime.datetime.now().isoformat()}] [Radar] Close error: {ce}")
+                    radar = None
+                    continue
 
-                        pts_enu = compensator.transform_pointcloud(pts_body)
-                        last_att_time = time.time()
-                    except Exception as e:
-                        print(f"[Autopilot][Compensation Error] {e.__class__.__name__}: {e}. Switching to raw points.")
-                        maybe_traceback()
+                # At this point, we have a valid header + det_obj + snr + noise
+                smoothed_det_obj = {'x': [], 'y': [], 'z': [], 'numObj': 0}
+                if det_obj and det_obj.get('numObj', 0) >= 3:
+                    spr = despiker.process(det_obj, snr, noise)
+                    pts_body = np.vstack((spr['x'], spr['y'], spr['z'])).T
+
+                    if compensator:
                         try:
-                            compensator.close()
-                        except Exception as ce:
-                            print(f"[Autopilot] Exception during compensator close: {ce}")
-                        compensator = None
+                            if calli_req:
+                                # Call calibration once
+                                compensator.internal_calibrate_offsets(num_samples=100, delay=0.01)
+                                calli_req = False  # Reset after one call
+
+                            pts_enu = compensator.transform_pointcloud(pts_body)
+                            last_att_time = time.time()
+                        except Exception as e:
+                            print(f"[Autopilot][Compensation Error] {e.__class__.__name__}: {e}. Switching to raw points.")
+                            maybe_traceback()
+                            try:
+                                compensator.close()
+                            except Exception as ce:
+                                print(f"[Autopilot] Exception during compensator close: {ce}")
+                            compensator = None
+                            pts_enu = pts_body
+                    else:
                         pts_enu = pts_body
+
+                    smoothed_det_obj = {
+                        'x': pts_enu[:, 0],
+                        'y': pts_enu[:, 1],
+                        'z': pts_enu[:, 2],
+                        'numObj': det_obj['numObj']
+                    }
+
+                # --- PLOTTING AND ASSESSMENT ---
+                # plotter.update(det_obj, smoothed_det_obj)
+
+                safe, m = assessor.assess(det_obj)
+                coeffs = m.get('plane', None)
+                if coeffs is None or not hasattr(coeffs, '__len__') or len(coeffs) < 4:
+                    radar.warn_print("Landing zone UNSAFE (Insufficient data for slope estimation)")
                 else:
-                    pts_enu = pts_body
+                    if safe:
+                        radar.info_print(
+                            f"Landing zone SAFE  slope={m['slope_deg']:.1f}deg, "
+                            f"inliers={m['inlier_ratio']*100:.0f}%, res={m['mean_residual']*100:.1f}cm"
+                        )
+                    else:
+                        radar.warn_print(
+                            f"Landing zone UNSAFE ({m.get('reason','')})  "
+                            f"slope={m.get('slope_deg',0):.1f}deg, "
+                            f"inliers={m.get('inlier_ratio',0)*100:.0f}%, res={m.get('mean_residual',0)*100:.1f}cm"
+                        )
 
-                smoothed_det_obj = {
-                    'x': pts_enu[:, 0],
-                    'y': pts_enu[:, 1],
-                    'z': pts_enu[:, 2],
-                    'numObj': det_obj['numObj']
-                }
+                # --- NEW: DISTANCE SENDING and LANDING MONITORING ---
+                if mode_watcher and landing_monitor:
+                    current_mode = mode_watcher.current_mode
+                    # This call is invoked each iteration, but send() enforces 10 Hz
+                    landing_monitor.update(smoothed_det_obj, m, current_mode)
 
-            # --- PLOTTING AND ASSESSMENT ---
-            # plotter.update(det_obj, smoothed_det_obj)
+                # gui.update_status(safe, m)
+                # app.processEvents()
 
-            safe, m = assessor.assess(det_obj)
-            coeffs = m.get('plane', None)
-            if coeffs is None or not hasattr(coeffs, '__len__') or len(coeffs) < 4:
-                radar.warn_print("Landing zone UNSAFE (Insufficient data for slope estimation)")
             else:
-                if safe:
-                    radar.info_print(
-                        f"Landing zone SAFE  slope={m['slope_deg']:.1f}deg, "
-                        f"inliers={m['inlier_ratio']*100:.0f}%, res={m['mean_residual']*100:.1f}cm"
-                    )
-                else:
-                    radar.warn_print(
-                        f"Landing zone UNSAFE ({m.get('reason','')})  "
-                        f"slope={m.get('slope_deg',0):.1f}deg, "
-                        f"inliers={m.get('inlier_ratio',0)*100:.0f}%, res={m.get('mean_residual',0)*100:.1f}cm"
-                    )
-
-            # --- NEW: DISTANCE SENDING and LANDING MONITORING ---
-            if mode_watcher and landing_monitor:
-                current_mode = mode_watcher.current_mode
-                # This call is invoked each iteration, but send() enforces 10 Hz
-                landing_monitor.update(smoothed_det_obj, m, current_mode)
-
-            # gui.update_status(safe, m)
-            # app.processEvents()
+                # No radar yet; small sleep to avoid busy loop
+                time.sleep(0.1)
 
     except KeyboardInterrupt:
-        print("[System] Interrupted by user. Exiting cleanly...")
+        print(f"[{datetime.datetime.now().isoformat()}] [System] Interrupted by user. Exiting...")
     except Exception as e:
-        print(f"[System] Unexpected error: {e.__class__.__name__}: {e}")
-        maybe_traceback()
-        time.sleep(2)
+        print(f"[{datetime.datetime.now().isoformat()}] [System] Unexpected: {e.__class__.__name__}: {e}")
+        traceback.print_exc()
+        time.sleep(1)
     finally:
         _autopilot_stop = True
         if mode_watcher:
             mode_watcher.stop()
         _thread.join(timeout=1.0)
 
-        # --- CLEANUP ---
+        radar_manager.stop()
+        radar_manager.join(timeout=1.0)
+
         if radar:
             try:
                 radar.close()
             except Exception as e:
-                print(f"[Cleanup] Failed to close radar: {e}")
+                print(f"[{datetime.datetime.now().isoformat()}] [Cleanup] Failed to close radar: {e}")
         if compensator:
             try:
                 compensator.close()
             except Exception as e:
-                print(f"[Cleanup] Failed to close compensator: {e}")
+                print(f"[{datetime.datetime.now().isoformat()}] [Cleanup] Failed to close compensator: {e}")
