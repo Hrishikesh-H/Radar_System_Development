@@ -329,7 +329,7 @@ class RadarManager(threading.Thread):
                     data = "/dev/ttyUSB1"
                     print(f"[{datetime.datetime.now().isoformat()}] [Radar] Using CLI={cli}, DATA={data}")
                     config_path = os.path.join(os.getcwd(), "best_res_4cm.cfg")
-                    radar = RadarParser(cli, data, config_path, debug=True, enable_logging=False, log_prefix="radar_log")
+                    radar = RadarParser(cli, data, config_path, debug=False, enable_logging=False, log_prefix="radar_log")
                     radar.initialize_ports()
                     radar.send_config()
                     time.sleep(2)
@@ -372,12 +372,12 @@ def _autopilot_reconnect_loop(finder):
             try:
                 master, _ = None, None
                 try:
-                    master, _ = finder.find_autopilot_connection(timeout=2.0, exclude_ports=[])
+                    master, _ = finder.find_autopilot_connection(timeout=10.0, exclude_ports=[])
                 except RuntimeError:
                     master = None
 
                 if master is None and cli and data:
-                    master, _ = finder.find_autopilot_connection(timeout=2.0, exclude_ports=[cli, data])
+                    master, _ = finder.find_autopilot_connection(timeout=10.0, exclude_ports=[cli, data])
 
                 if master:
                     compensator = AttitudeCompensator(master)
