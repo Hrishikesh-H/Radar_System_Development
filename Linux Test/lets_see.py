@@ -22,91 +22,75 @@ from PlaneLand import LandingZoneAssessor
 from IMUCompensator import AttitudeCompensator
 
 # ============================ DistanceSensorSender ============================
-
 class DistanceSensorSender:
-    """
-    Handles sending MAVLink DISTANCE_SENSOR messages at a fixed rate (10 Hz),
-    using MAVLink 1.0 framing, with console logging, error reporting, and traceback on failure.
-    """
     def __init__(self, mav, min_range=0.05, max_range=5.0, send_rate_hz=10):
-        """
-        mav: an active pymavlink connection (master)
-        min_range, max_range: sensor bounds in meters
-        send_rate_hz: frequency at which to send DISTANCE_SENSOR messages
-        """
         self.mav = mav
         self.min_distance_cm = max(0, min(int(min_range * 100), 65535))
         self.max_distance_cm = max(0, min(int(max_range * 100), 65535))
+        
+        # Fixed parameters
         self.SENSOR_TYPE = mavutil.mavlink.MAV_DISTANCE_SENSOR_LASER
-        self.SENSOR_ID = 0
+        self.SENSOR_ID = 1  # Changed from 0 to avoid conflicts
         self.ROTATION_DOWNWARD = mavutil.mavlink.MAV_SENSOR_ROTATION_PITCH_270
-        self.COVARIANCE_UNKNOWN = 255
-
+        self.COVARIANCE_UNKNOWN = 0  # Changed from 255 for compatibility
+        
+        # MAVLink 2.0 parameters
+        self.horizontal_fov = 0.0
+        self.vertical_fov = 0.0
+        self.quaternion = [0.0, 0.0, 0.0, 0.0]
+        self.signal_quality = 0
+        
         self.send_interval = 1.0 / send_rate_hz
         self._last_send_time = 0.0
 
     def send(self, distance_m):
-        """
-        Send a DISTANCE_SENSOR message at up to the configured rate.
-        Uses the helper .distance_sensor_encode() to guarantee correct MAVLink 1.0 formatting.
-        Prints traceback if send fails, and dumps raw bytes before sending.
-        """
         now = time.time()
         if (now - self._last_send_time) < self.send_interval:
             return
-
+            
         self._last_send_time = now
         ts = datetime.datetime.now().isoformat()
-
+        
         try:
-            # Compute raw and clamped centimeters
-            if isinstance(distance_m, (int, float)):
+            # Improved distance validation
+            if distance_m is None or not isinstance(distance_m, (int, float)) or distance_m <= 0:
+                current_cm = self.max_distance_cm
+            else:
                 raw_cm = int(round(distance_m * 100))
                 current_cm = max(self.min_distance_cm, min(raw_cm, self.max_distance_cm))
-            else:
-                current_cm = self.max_distance_cm
-
-            print(f"[{ts}] [DEBUG] Raw distance = {distance_m if distance_m is not None else 'None'} -> {current_cm} cm")
-            print(f"[{ts}] [DEBUG] Clamping distance between {self.min_distance_cm} and {self.max_distance_cm} cm")
-
-            time_boot_ms = int(self.mav.time_since('SYSTEM_BOOT') * 1000)
-            if time_boot_ms <= 0:
-                print(f"[{ts}] [WARNING] time_boot_ms = {time_boot_ms} (check FC time_since('SYSTEM_BOOT')).")
-
-            msg = self.mav.mav.distance_sensor_encode(
-                time_boot_ms,
-                self.min_distance_cm,
-                self.max_distance_cm,
-                current_cm,
-                self.SENSOR_TYPE,
-                self.SENSOR_ID,
-                self.ROTATION_DOWNWARD,
-                self.COVARIANCE_UNKNOWN
-            )
-            raw = msg.pack(self.mav.mav)
-            print(f"[{ts}] [DEBUG] -> RAW MAVLINK DISTANCE_SENSOR: {raw.hex(' ')}")
-
+            
+            # Improved time_boot_ms calculation with fallback
             try:
-                self.mav.write(raw)
-                print(f"[{ts}] [DEBUG] distance_sensor packet written to MAVLink channel")
-            except Exception:
-                print(f"[{ts}] [ERROR] MAVLink write(raw) raised an exception:")
-                traceback.print_exc()
-                return
-
+                time_boot_ms = int(self.mav.time_since('SYSTEM_BOOT') * 1000)
+                if time_boot_ms <= 0:
+                    time_boot_ms = int((time.time() % (2**32)) * 1000)
+            except:
+                time_boot_ms = int((time.time() % (2**32)) * 1000)
+            
+            # Try MAVLink 2.0 first, fallback to 1.0
             try:
-                msg_fb = self.mav.recv_match(type='DISTANCE_SENSOR', blocking=False)
-                if msg_fb and msg_fb.current_distance:
-                    print(f"[{ts}] [DEBUG] FC reply: DISTANCE_SENSOR = {msg_fb.current_distance} cm")
-            except SerialException as ser_e:
-                print(f"[{ts}] [ERROR] SerialException in non-blocking recv_match: {ser_e}")
+                self.mav.mav.distance_sensor_send(
+                    time_boot_ms, self.min_distance_cm, self.max_distance_cm,
+                    current_cm, self.SENSOR_TYPE, self.SENSOR_ID,
+                    self.ROTATION_DOWNWARD, self.COVARIANCE_UNKNOWN,
+                    self.horizontal_fov, self.vertical_fov,
+                    self.quaternion, self.signal_quality
+                )
             except Exception:
-                print(f"[{ts}] [ERROR] Unexpected exception in recv_match:")
-                traceback.print_exc()
-
-        except Exception:
-            print(f"[{ts}] [ERROR] send() failed:")
+                # Fallback to MAVLink 1.0 format
+                self.mav.mav.distance_sensor_send(
+                    time_boot_ms, self.min_distance_cm, self.max_distance_cm,
+                    current_cm, self.SENSOR_TYPE, self.SENSOR_ID,
+                    self.ROTATION_DOWNWARD, self.COVARIANCE_UNKNOWN
+                )
+            
+            # Small delay to ensure transmission
+            time.sleep(0.001)
+            
+        except Exception as e:
+            print(f"[{ts}] [ERROR] Distance sensor send failed: {e}")
             traceback.print_exc()
+
 
 
 # ============================ ModeWatcher ============================
