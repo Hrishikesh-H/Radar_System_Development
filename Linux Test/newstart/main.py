@@ -5,6 +5,7 @@ import argparse
 from system_logger import init_logger, get_logger, set_console_log_level
 from port_finder import DevicePortFinder
 from radar_interface import RadarParser
+from radar_despiker import RadarDespiker  # Import the despiker
 import os
 
 
@@ -26,17 +27,10 @@ def main():
         cli_port, data_port = port_finder.find_radar_ports_by_description()
         logger.info(f"Found radar ports: CLI={cli_port}, DATA={data_port}")
 
-        # # Find autopilot (exclude radar ports)
-        # ap_conn, ap_info = port_finder.find_autopilot_connection(
-        #     exclude_ports=[cli_port, data_port]
-        # )
-        # if ap_info:
-        #     logger.info(f"Autopilot connected: {ap_info}")
-
         # Initialize radar interface
         radar = RadarParser(
-            cli_port=cli_port,
-            data_port=data_port,
+            cli_port=data_port,
+            data_port=cli_port,
             config_file=config_path,
             cli_baud=115200,
             data_baud=921600,
@@ -46,9 +40,12 @@ def main():
         time.sleep(2)
         logger.info("Radar initialized and configured")
 
+        # Initialize radar despiker
+        despiker = RadarDespiker()
+        logger.info("Radar despiker initialized")
+
         # Radar data processing loop
         logger.info("Starting radar data processing...")
-        # In main loop
         last_log_time = time.time()
         frame_count = 0
 
@@ -57,8 +54,15 @@ def main():
         while True:
             header, det_obj, snr, noise = radar.read_frame()
 
+
             if header is not None:
                 frame_count += 1
+
+                # Apply despiker to the detection objects
+                if det_obj is not None:
+                    logger.info(f"Frame #{frame_count}: {det_obj}")
+                    det_obj = despiker.process(det_obj, snr, noise)
+
                 logger.info(f"Frame {frame_count}: {header['num_detected_obj']} objects")
 
                 if det_obj is not None:
@@ -66,13 +70,11 @@ def main():
                         logger.info(f"  Object {i + 1}: "
                                     f"x={det_obj['x'][i]:.2f}m, "
                                     f"y={det_obj['y'][i]:.2f}m, "
-                                    f"z={det_obj['z'][i]:.2f}m, "
-                                    f"vel={det_obj['velocity'][i]:.2f}m/s")
+                                    f"z={det_obj['z'][i]:.2f}m, ")
 
             # Periodic status log
             if time.time() - last_log_time > 5:
-                logger.info(f"Status: Processed {frame_count} frames | "
-                            f"Buffer: dont know bytes")
+                logger.info(f"Status: Processed {frame_count} frames")
                 last_log_time = time.time()
 
             time.sleep(0.001)
