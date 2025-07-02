@@ -37,7 +37,8 @@ def main():
             'timestamp', 'frame_id', 'object_id',
             'original_x', 'original_y', 'original_z',
             'despiked_x', 'despiked_y', 'despiked_z',
-            'snr', 'noise', 'num_objects'
+            'snr', 'noise', 'num_objects',
+            'landing_safe', 'slope_deg', 'inlier_ratio', 'surface_quality'
         ])
         logger.info(f"Data logging to: {output_file}")
 
@@ -59,9 +60,10 @@ def main():
         time.sleep(2)
         logger.info("Radar initialized and configured")
 
-        # Initialize radar despiker
+        # Initialize radar despiker and landing assessor
         despiker = RadarDespiker()
-        logger.info("Radar despiker initialized")
+        land_assessor = LandingZoneAssessor()  # Create once and reuse
+        logger.info("Processing modules initialized")
 
         # Radar data processing loop
         logger.info("Starting radar data processing...")
@@ -77,17 +79,31 @@ def main():
                 frame_count += 1
                 timestamp = datetime.now().isoformat()
                 num_objects = header['num_detected_obj']
+                landing_safe = False
+                metrics = {}
 
                 # Store original data before processing
                 original_det_obj = det_obj
 
                 # Apply despiker to the detection objects
                 if det_obj is not None:
-                    despiked_det_obj = despiker.process(det_obj, snr)
+                    despiked_det_obj = despiker.process(det_obj, snr, noise)
                 else:
                     despiked_det_obj = None
 
                 logger.info(f"Frame {frame_count}: {num_objects} objects")
+
+                # Assess landing zone if we have valid data
+                if despiked_det_obj is not None and despiked_det_obj.get('numObj', 0) >= 3:
+                    safe, metrics = land_assessor.assess(
+                        despiked_det_obj,
+                        plane_params=despiked_det_obj.get('plane_params'),
+                        inlier_mask=despiked_det_obj.get('inlier_mask')
+                    )
+                    landing_safe = safe
+                    logger.info(f"Landing safe: {safe}, " 
+                                f"Slope: {metrics.get('slope_deg', 0):.1f}°, "
+                                f"Quality: {metrics.get('surface_quality', 0):.2f}")
 
                 # Log to CSV
                 if original_det_obj is not None and despiked_det_obj is not None:
@@ -101,20 +117,19 @@ def main():
                             timestamp, frame_count, i + 1,
                             original_det_obj['x'][i], original_det_obj['y'][i], original_det_obj['z'][i],
                             despiked_det_obj['x'][i], despiked_det_obj['y'][i], despiked_det_obj['z'][i],
-                            snr_val, noise_val, num_objects
+                            snr_val, noise_val, num_objects,
+                            landing_safe,
+                            metrics.get('slope_deg', 0),
+                            metrics.get('inlier_ratio', 0),
+                            metrics.get('surface_quality', 0)
                         ])
 
                 # For debugging: log first object
-                if despiked_det_obj is not None and despiked_det_obj['numObj'] > 0:
-                    logger.info(f"  Object 1: "
+                if despiked_det_obj is not None and despiked_det_obj.get('numObj', 0) > 0:
+                    logger.debug(f"  Object 1: "
                                 f"x={despiked_det_obj['x'][0]:.2f}m, "
                                 f"y={despiked_det_obj['y'][0]:.2f}m, "
                                 f"z={despiked_det_obj['z'][0]:.2f}m")
-
-                    land_assessor = LandingZoneAssessor()
-                    safe , metrics = land_assessor.assess(despiked_det_obj)
-
-                    logger.info(f"{safe} is the status")
 
             # Periodic status log and CSV flush
             if time.time() - last_log_time > 5:
