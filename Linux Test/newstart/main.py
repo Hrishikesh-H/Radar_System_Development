@@ -2,12 +2,14 @@
 import logging
 import time
 import argparse
+import os
+import csv
+from datetime import datetime
 from system_logger import init_logger, get_logger, set_console_log_level
 from port_finder import DevicePortFinder
 from radar_interface import RadarParser
-from radar_despiker import RadarDespiker  # Import the despiker
-import os
-
+from radar_despiker import RadarDespiker
+from plane_land import LandingZoneAssessor
 
 def main():
     # Initialize centralized logging with INFO level
@@ -17,11 +19,28 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Radar and Autopilot Interface')
     parser.add_argument('--config', default="best_res_4cm.cfg", help='Path to radar configuration file')
+    parser.add_argument('--output', default="radar_data", help='Output CSV file name')
     args = parser.parse_args()
 
     config_path = os.path.join(os.getcwd(), args.config)
+    output_file = os.path.join(os.getcwd(), args.output)
+
+    # Prepare CSV file for logging data
+    csv_file = None
+    csv_writer = None
 
     try:
+        # Open CSV file and write header
+        csv_file = open(output_file, 'w', newline='')
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            'timestamp', 'frame_id', 'object_id',
+            'original_x', 'original_y', 'original_z',
+            'despiked_x', 'despiked_y', 'despiked_z',
+            'snr', 'noise', 'num_objects'
+        ])
+        logger.info(f"Data logging to: {output_file}")
+
         # Find radar ports
         port_finder = DevicePortFinder()
         cli_port, data_port = port_finder.find_radar_ports_by_description()
@@ -54,28 +73,55 @@ def main():
         while True:
             header, det_obj, snr, noise = radar.read_frame()
 
-
             if header is not None:
                 frame_count += 1
+                timestamp = datetime.now().isoformat()
+                num_objects = header['num_detected_obj']
+
+                # Store original data before processing
+                original_det_obj = det_obj
 
                 # Apply despiker to the detection objects
                 if det_obj is not None:
-                    logger.info(f"Frame #{frame_count}: {det_obj}")
-                    det_obj = despiker.process(det_obj, snr, noise)
+                    despiked_det_obj = despiker.process(det_obj, snr)
+                else:
+                    despiked_det_obj = None
 
-                logger.info(f"Frame {frame_count}: {header['num_detected_obj']} objects")
+                logger.info(f"Frame {frame_count}: {num_objects} objects")
 
-                if det_obj is not None:
-                    for i in range(det_obj['numObj']):
-                        logger.info(f"  Object {i + 1}: "
-                                    f"x={det_obj['x'][i]:.2f}m, "
-                                    f"y={det_obj['y'][i]:.2f}m, "
-                                    f"z={det_obj['z'][i]:.2f}m, ")
+                # Log to CSV
+                if original_det_obj is not None and despiked_det_obj is not None:
+                    num_objects = min(len(original_det_obj['x']), len(despiked_det_obj['x']))
+                    for i in range(num_objects):
+                        # Get SNR and noise values if available
+                        snr_val = snr[i] if snr is not None and i < len(snr) else -1
+                        noise_val = noise[i] if noise is not None and i < len(noise) else -1
 
-            # Periodic status log
+                        csv_writer.writerow([
+                            timestamp, frame_count, i + 1,
+                            original_det_obj['x'][i], original_det_obj['y'][i], original_det_obj['z'][i],
+                            despiked_det_obj['x'][i], despiked_det_obj['y'][i], despiked_det_obj['z'][i],
+                            snr_val, noise_val, num_objects
+                        ])
+
+                # For debugging: log first object
+                if despiked_det_obj is not None and despiked_det_obj['numObj'] > 0:
+                    logger.info(f"  Object 1: "
+                                f"x={despiked_det_obj['x'][0]:.2f}m, "
+                                f"y={despiked_det_obj['y'][0]:.2f}m, "
+                                f"z={despiked_det_obj['z'][0]:.2f}m")
+
+                    land_assessor = LandingZoneAssessor()
+                    safe , metrics = land_assessor.assess(despiked_det_obj)
+
+                    logger.info(f"{safe} is the status")
+
+            # Periodic status log and CSV flush
             if time.time() - last_log_time > 5:
                 logger.info(f"Status: Processed {frame_count} frames")
                 last_log_time = time.time()
+                if csv_file:
+                    csv_file.flush()  # Ensure data is written to disk
 
             time.sleep(0.001)
 
@@ -86,6 +132,9 @@ def main():
     finally:
         if 'radar' in locals():
             radar.close()
+        if csv_file:
+            csv_file.close()
+            logger.info(f"CSV file closed: {output_file}")
 
 
 if __name__ == "__main__":

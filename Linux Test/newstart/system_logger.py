@@ -2,13 +2,14 @@
 import logging
 import os
 from logging.handlers import RotatingFileHandler
+import datetime
 
 class SystemLogger:
     def __init__(self, log_dir="logs", 
                  console_level=logging.WARNING,
                  file_level=logging.DEBUG,
                  max_bytes=10*1024*1024, 
-                 backup_count=5):
+                 backup_count=3):
         self.log_dir = log_dir
         self.console_level = console_level
         self.file_level = file_level
@@ -33,7 +34,7 @@ class SystemLogger:
         self.root_logger.addHandler(self.console_handler)
         
         # File handler with rotation and full detail
-        log_file = os.path.join(self.log_dir, "system.log")
+        log_file = os.path.join(self.log_dir, f"system_{datetime.datetime.now().date().isoformat()}.log")
         self.file_handler = RotatingFileHandler(
             log_file, maxBytes=self.max_bytes, backupCount=self.backup_count
         )
@@ -68,7 +69,7 @@ class SystemLogger:
 # Global logger instance (singleton)
 system_logger = None
 
-def init_logger(log_dir="logs", console_level=logging.WARNING, file_level=logging.DEBUG):
+def init_logger(log_dir="logs", console_level=logging.INFO, file_level=logging.DEBUG):
     """Initialize the global logger"""
     global system_logger
     if system_logger is None:
