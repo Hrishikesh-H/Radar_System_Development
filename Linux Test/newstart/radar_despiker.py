@@ -18,7 +18,7 @@ class RadarDespiker:
 
         try:
             from sklearn.neighbors import NearestNeighbors
-            nbrs = NearestNeighbors(n_neighbors=min(k_neighbors, n_points-1)).fit(points)
+            nbrs = NearestNeighbors(n_neighbors=min(k_neighbors, n_points - 1)).fit(points)
             distances, _ = nbrs.kneighbors(points)
             mean_distances = np.mean(distances[:, 1:], axis=1)
             mean_dist = np.mean(mean_distances)
@@ -37,16 +37,18 @@ class RadarDespiker:
         try:
             from sklearn.neighbors import NearestNeighbors
             nbrs = NearestNeighbors(radius=radius_thresh).fit(points)
-            neighbor_counts = np.array([len(indices)-1 for indices in nbrs.radius_neighbors(points)[1]])
+            neighbor_counts = np.array([len(indices) - 1 for indices in nbrs.radius_neighbors(points)[1]])
             return neighbor_counts >= min_neighbors
         except ImportError:
             self.logger.error("scikit-learn not available, skipping radius outlier removal")
             return np.ones(n_points, dtype=bool)
 
     def process(self, det_obj, snr=None, noise=None):
-        x = np.asarray(det_obj['x'])
-        y = np.asarray(det_obj['y'])
-        z = np.asarray(det_obj['z'])
+        # Flatten input arrays to ensure 1D
+        x = np.asarray(det_obj['x']).flatten()
+        y = np.asarray(det_obj['y']).flatten()
+        z = np.asarray(det_obj['z']).flatten()
+
         num = det_obj.get('numObj')
         curr_len = len(x)
 
@@ -60,7 +62,15 @@ class RadarDespiker:
             valid_count = np.sum(snr_mask)
             if valid_count < max(3, curr_len // 4):
                 top_n = max(3, curr_len // 2)
-                top_indices = np.argpartition(snr_arr, -top_n)[-top_n:]
+                n = len(snr_arr)
+                if top_n <= 0:
+                    top_indices = np.array([], dtype=int)
+                elif top_n >= n:
+                    top_indices = np.arange(n)
+                else:
+                    kth_index = n - top_n
+                    partitioned_indices = np.argpartition(snr_arr, kth_index)
+                    top_indices = partitioned_indices[kth_index:]
                 snr_mask = np.zeros(curr_len, dtype=bool)
                 snr_mask[top_indices] = True
         else:
@@ -90,7 +100,15 @@ class RadarDespiker:
         if np.sum(valid_mask) < max(3, curr_len // 4):
             sort_arr = snr_arr if snr_arr is not None and len(snr_arr) == curr_len else np.ones(curr_len)
             top_n = max(3, curr_len // 2)
-            top_indices = np.argpartition(sort_arr, -top_n)[-top_n:]
+            n = len(sort_arr)
+            if top_n <= 0:
+                top_indices = np.array([], dtype=int)
+            elif top_n >= n:
+                top_indices = np.arange(n)
+            else:
+                kth_index = n - top_n
+                partitioned_indices = np.argpartition(sort_arr, kth_index)
+                top_indices = partitioned_indices[kth_index:]
             valid_mask = np.zeros(curr_len, dtype=bool)
             valid_mask[top_indices] = True
 
@@ -98,16 +116,29 @@ class RadarDespiker:
         plane_params, plane_inlier_mask, _ = None, None, None
         if np.sum(valid_mask) >= 3:
             try:
+                # Ensure weights are 1D
+                weights = quality_weights[valid_mask].flatten()
+
                 plane_params, plane_inlier_mask, _ = self.plane_detector.fit_plane(
                     points_3d[valid_mask],
-                    weights=quality_weights[valid_mask]
+                    weights=weights
                 )
 
-                # Enhance valid mask with plane inliers
+                # Ensure plane_inlier_mask is 1D
                 if plane_inlier_mask is not None:
-                    full_plane_mask = np.zeros(curr_len, dtype=bool)
-                    full_plane_mask[np.where(valid_mask)[0]] = plane_inlier_mask
-                    valid_mask &= full_plane_mask
+                    plane_inlier_mask = plane_inlier_mask.flatten()
+
+                    # Create a new mask instead of modifying in-place
+                    new_plane_mask = np.zeros(curr_len, dtype=bool)
+                    valid_indices = np.where(valid_mask)[0]
+
+                    # Handle case where plane_inlier_mask might be wrong size
+                    if len(plane_inlier_mask) == len(valid_indices):
+                        new_plane_mask[valid_indices] = plane_inlier_mask
+                        valid_mask = new_plane_mask
+                    else:
+                        self.logger.warning(
+                            f"Plane mask size mismatch: {len(plane_inlier_mask)} vs {len(valid_indices)}")
             except Exception as e:
                 self.logger.debug(f"Plane detection failed: {str(e)}")
 

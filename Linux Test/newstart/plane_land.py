@@ -200,7 +200,7 @@ class LandingZoneAssessor:
             if not safe:
                 reasons = []
                 if slope_deg > self.slope_thresh_deg:
-                    reasons.append(f'slope too steep ({slope_deg:.1f}° > {self.slope_thresh_deg}°)')
+                    reasons.append(f'slope too steep ({slope_deg:.1f}deg > {self.slope_thresh_deg}deg)')
                 if inlier_ratio < self.inlier_ratio_thresh:
                     reasons.append(f'low inlier ratio ({inlier_ratio:.2f} < {self.inlier_ratio_thresh})')
                 if mean_residual > self.distance_thresh:

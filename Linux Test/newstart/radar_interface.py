@@ -183,17 +183,33 @@ class RadarParser:
         snr = None
         noise = None
 
+        # Get actual packet length for bounds checking
+        packet_len = len(packet)
+
         for i in range(header['num_tlvs']):
+            # Check if we have enough bytes for TLV header
+            if offset + 8 > packet_len:
+                self.logger.warning("Insufficient bytes for TLV header")
+                break
+
             tlv_type, tlv_length = struct.unpack_from('<II', mv, offset)
-            self.logger.info(f"TLV {i+1}: Type={tlv_type}, Length={tlv_length}")
+            self.logger.info(f"TLV {i + 1}: Type={tlv_type}, Length={tlv_length}")
             offset += 8
+
+            # Check if TLV data fits in packet
+            if offset + tlv_length > packet_len:
+                self.logger.warning("TLV data exceeds packet length")
+                break
+
             if tlv_type == 1:
-                det_obj, offset = self.parse_tlv_1(mv, offset, header['num_detected_obj'])
+                det_obj, new_offset = self.parse_tlv_1(mv, offset, header['num_detected_obj'])
+                offset = new_offset
             elif tlv_type == 7:
-                snr, noise, offset = self.parse_tlv_7(mv, offset, header['num_detected_obj'])
+                snr, noise, new_offset = self.parse_tlv_7(mv, offset, header['num_detected_obj'])
+                offset = new_offset
             else:
                 self.logger.info(f"Skipping TLV type {tlv_type}")
-                offset += tlv_length
+                offset += tlv_length  # Skip unknown TLV types
 
         return header, det_obj, (snr, noise)
 
