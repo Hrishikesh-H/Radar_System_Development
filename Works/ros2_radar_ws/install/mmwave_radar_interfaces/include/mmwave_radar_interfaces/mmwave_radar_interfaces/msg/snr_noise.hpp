@@ -1,0 +1,12 @@
+// generated from rosidl_generator_cpp/resource/idl.hpp.em
+// generated code does not contain a copyright notice
+
+#ifndef MMWAVE_RADAR_INTERFACES__MSG__SNR_NOISE_HPP_
+#define MMWAVE_RADAR_INTERFACES__MSG__SNR_NOISE_HPP_
+
+#include "mmwave_radar_interfaces/msg/detail/snr_noise__struct.hpp"
+#include "mmwave_radar_interfaces/msg/detail/snr_noise__builder.hpp"
+#include "mmwave_radar_interfaces/msg/detail/snr_noise__traits.hpp"
+#include "mmwave_radar_interfaces/msg/detail/snr_noise__type_support.hpp"
+
+#endif  // MMWAVE_RADAR_INTERFACES__MSG__SNR_NOISE_HPP_

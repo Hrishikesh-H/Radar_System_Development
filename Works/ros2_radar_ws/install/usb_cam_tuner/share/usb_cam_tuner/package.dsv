@@ -1,0 +1,6 @@
+source;share/usb_cam_tuner/hook/pythonpath.ps1
+source;share/usb_cam_tuner/hook/pythonpath.dsv
+source;share/usb_cam_tuner/hook/pythonpath.sh
+source;share/usb_cam_tuner/hook/ament_prefix_path.ps1
+source;share/usb_cam_tuner/hook/ament_prefix_path.dsv
+source;share/usb_cam_tuner/hook/ament_prefix_path.sh

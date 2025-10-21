@@ -1,0 +1,15 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from mmwave_radar_interfaces/msg/RawPacket.msg
+// generated code does not contain a copyright notice
+
+#include "std_msgs/msg/ByteMultiArray.idl"
+
+module mmwave_radar_interfaces {
+  module msg {
+    @verbatim (language="comment", text=
+      "Raw packet bytes using standard multi-array")
+    struct RawPacket {
+      std_msgs::msg::ByteMultiArray data;
+    };
+  };
+};

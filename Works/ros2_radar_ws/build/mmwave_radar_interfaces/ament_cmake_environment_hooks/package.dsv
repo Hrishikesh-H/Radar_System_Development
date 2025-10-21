@@ -1,0 +1,4 @@
+source;share/mmwave_radar_interfaces/local_setup.bash
+source;share/mmwave_radar_interfaces/local_setup.dsv
+source;share/mmwave_radar_interfaces/local_setup.sh
+source;share/mmwave_radar_interfaces/local_setup.zsh

@@ -1,0 +1,22 @@
+// generated from rosidl_adapter/resource/msg.idl.em
+// with input from mmwave_radar_interfaces/msg/DetectedObjects.msg
+// generated code does not contain a copyright notice
+
+
+module mmwave_radar_interfaces {
+  module msg {
+    @verbatim (language="comment", text=
+      "Detected Objects (TLV1)")
+    struct DetectedObjects {
+      uint32 num_obj;
+
+      sequence<float> x;
+
+      sequence<float> y;
+
+      sequence<float> z;
+
+      sequence<float> velocity;
+    };
+  };
+};
